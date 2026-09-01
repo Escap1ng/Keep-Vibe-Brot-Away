@@ -1,0 +1,209 @@
+/* M3 色彩系统(种子:包豪斯红)+ 包豪斯要素 + 动效令牌(animate skill 哲学) */
+
+:root {
+  /* 色板(Material 3 tonal,种子 #B3261E/包豪斯红) */
+  --md-primary: #b3261e;
+  --on-primary: #ffffff;
+  --md-primary-container: #ffdad6;
+  --on-primary-container: #410002;
+  --md-secondary: #4355b9; /* 包豪斯群青 */
+  --md-secondary-container: #dde1ff;
+  --on-secondary-container: #00105c;
+  --md-tertiary: #8e5b00; /* 包豪斯柠檬黄(深色 t。保证对比) */
+  --md-tertiary-container: #ffdea6;
+  --on-tertiary-container: #2d1800;
+  --md-surface: #faf8f7;
+  --md-surface-variant: #f3dede;
+  --md-on-surface: #201a19;
+  --md-on-surface-variant: #857370;
+  --md-outline: #857370;
+  --md-outline-variant: #d8c2c0;
+  --md-error: #ba1a1a;
+  --md-error-container: #ffdad6;
+  --md-on-error-container: #410002;
+
+  /* 包豪斯墨线 */
+  --bb-ink: #201a19;
+  --bb-gold: #f9a825;
+
+  /* 语义 */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-2: 0 1px 3px rgba(0, 0, 0, 0.14), 0 4px 12px rgba(0, 0, 0, 0.1);
+  --shadow-3: 0 2px 6px rgba(0, 0, 0, 0.16), 0 10px 28px rgba(0, 0, 0, 0.16);
+
+  /* 动效令牌(强曲线,禁止混入 ease-in) */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur-1: 150ms;
+  --dur-2: 220ms;
+  --dur-3: 300ms;
+
+  /* 圆角(M3) */
+  --r-xs: 4px;
+  --r-s: 8px;
+  --r-m: 12px;
+  --r-l: 16px;
+  --r-xl: 28px;
+  --r-full: 999px;
+
+  /* 字体 */
+  --font: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --fs-sm: 12px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-primary: #ffb4ab;
+    --on-primary: #690005;
+    --md-primary-container: #8c1d18;
+    --on-primary-container: #ffdad6;
+    --md-secondary: #b9c3ff;
+    --on-secondary-container: #00105c;
+    --md-secondary-container: #2a3c8f;
+    --md-tertiary: #f5b954;
+    --on-tertiary-container: #3f2b00;
+    --md-tertiary-container: #5e4200;
+    --md-surface: #1c1413;
+    --md-surface-variant: #524343;
+    --md-on-surface: #f5edea;
+    --md-on-surface-variant: #d8c2c0;
+    --md-outline: #a08c8a;
+    --md-outline-variant: #524343;
+    --md-error: #ffb4ab;
+    --md-error-container: #93000a;
+    --md-on-error-container: #ffdad6;
+    --bb-ink: #f5edea;
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow-2: 0 1px 3px rgba(0, 0, 0, 0.6), 0 4px 14px rgba(0, 0, 0, 0.4);
+    --shadow-3: 0 2px 6px rgba(0, 0, 0, 0.6), 0 10px 30px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* ---------- 基底 ---------- */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  font-family: var(--font);
+  font-size: var(--fs-md);
+  color: var(--md-on-surface);
+  background: transparent;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+body.label-transparent {
+  background: transparent;
+}
+body.label-settings {
+  background: var(--md-surface);
+  overflow-y: auto;
+}
+
+/* ---------- 键盘可达性 ---------- */
+:focus-visible {
+  outline: 2px solid var(--md-secondary);
+  outline-offset: 2px;
+}
+
+button {
+  font-family: var(--font);
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 按压反馈:所有可点元素(M6 资产) */
+.pressable {
+  transition: transform var(--dur-1) var(--ease-out), background-color var(--dur-2) ease;
+}
+@media (hover: hover) {
+  .pressable:hover {
+    background: var(--md-primary-container);
+  }
+}
+.pressable:active {
+  transform: scale(0.97);
+}
+
+/* ---------- 复用部件 ---------- */
+.kvba-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-s);
+  font-size: var(--fs-sm);
+  line-height: 18px;
+  background: var(--md-surface-variant);
+  color: var(--md-on-surface-variant);
+  letter-spacing: 0.02em;
+}
+.kvba-chip.bb-bauhaus {
+  border-radius: var(--r-xs);
+  border: 1px solid var(--bb-ink);
+  background: transparent;
+}
+
+.kvba-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-full);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  transition: transform var(--dur-1) var(--ease-out), background-color var(--dur-2) ease,
+    box-shadow var(--dur-2) ease;
+}
+.kvba-btn:active {
+  transform: scale(0.97);
+}
+.kvba-btn.primary {
+  background: var(--md-primary);
+  color: var(--on-primary);
+  box-shadow: var(--shadow-1);
+}
+.kvba-btn.tonal {
+  background: var(--md-secondary-container);
+  color: var(--on-secondary-container);
+}
+.kvba-btn.outlined {
+  border: 1px solid var(--md-outline);
+  color: var(--md-on-surface);
+}
+.kvba-btn.text {
+  color: var(--md-on-surface);
+  border-radius: var(--r-full);
+}
+.kvba-btn.danger {
+  color: var(--md-error);
+}
+
+/* 胶囊卡片表面(面板内) */
+.kvba-card {
+  background: var(--md-surface);
+  border-radius: var(--r-l, 16px);
+  box-shadow: var(--shadow-2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

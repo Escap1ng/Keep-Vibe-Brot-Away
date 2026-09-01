@@ -1,0 +1,22 @@
+[package]
+name = "kvba-claude-adapters"
+version = "0.1.0"
+edition = "2021"
+description = "KVBA 适配器:claude-code hooks 桥 + jsonl watcher"
+
+[lib]
+name = "kvba_adapters"
+
+[[bin]]
+name = "kvba-claude-bridge"
+path = "src/bin/bridge.rs"
+
+[[bin]]
+name = "kvba-claude-watcher"
+path = "src/bin/watcher.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+blake3 = "1"

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://github.com/anthropics/claude-code/blob/main/docs/hooks.md",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|Patch|Bash|Read|Grep|Glob|Think",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\admin\\kvba\\kvba-claude-bridge.exe",
+            "timeout": 3,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\admin\\kvba\\kvba-claude-bridge.exe",
+            "timeout": 3,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
