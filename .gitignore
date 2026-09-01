@@ -1,0 +1,13 @@
+node_modules
+dist
+target
+*.log
+.kvba
+
+# 本地 agent 工具链(非产品代码)
+.opencode/skills/
+.opencode/node_modules/
+
+# 移动端图标(本期仅桌面)
+src-tauri/icons/android/
+src-tauri/icons/ios/

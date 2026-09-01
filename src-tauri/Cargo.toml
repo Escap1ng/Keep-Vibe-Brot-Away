@@ -1,0 +1,48 @@
+[package]
+name = "kvba"
+version = "0.1.0"
+description = "Keep-Vibe-Brot-Away - 项目伴读:在 VibeCoding 间隙递知识、抛问题"
+edition = "2021"
+
+[lib]
+name = "kvba_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-log = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+log = "0.4"
+blake3 = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = "0.10"
+rand = "0.8"
+chrono = "0.4"
+thiserror = "2"
+futures-util = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

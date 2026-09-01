@@ -1,0 +1,430 @@
+//! 全局状态中心:所有数据都经由此处串行化访问,并负责持久化路径分发。
+//!
+//! 数据目录布局(KVBA 所有用户数据):
+//! ```text
+//! <dataDir>/
+//! ├─ settings.json        设置(非机密)
+//! ├─ secrets.enc          密钥(AES-256-GCM 加密,密钥由 HKDF(机器指纹,salt) 派生)
+//! ├─ queue.json           待答队列 + 历史
+//! ├─ cooldown.json        主题冷却矩阵
+//! ├─ budget.json          当日 LLM 调用预算快照
+//! ├─ decision-log.jsonl   门控决策日志(滚动 200 条)
+//! ├─ endpoint.json        本地 HTTP 端点信息(端口 + 握手 token)
+//! └─ projects/<sha256(path)[..16]>/
+//!    ├─ events.log        归一化事件滚动日志(JSONL,最近 200 条)
+//!    └─ facts.json        项目全局记忆(≤50KB)
+//! ```
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager};
+
+/// 核心状态锁:std 互斥(临界区极短,无 await 依赖),保证异步/同步上下文通用
+pub struct CoreLock(std::sync::Mutex<Core>);
+
+impl CoreLock {
+    pub fn blocking_lock(&self) -> std::sync::MutexGuard<'_, Core> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl From<Core> for CoreLock {
+    fn from(core: Core) -> Self {
+        CoreLock(std::sync::Mutex::new(core))
+    }
+}
+
+use crate::events::NormalizedEvent;
+use crate::memory::Facts;
+use crate::queue::{Card, CooldownMap};
+use crate::settings::Settings;
+
+/// 项目键:由项目路径计算(sha256 + 前缀),作为事件/记忆隔离的 key
+pub fn project_key(project_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(project_path.as_bytes());
+    let out = format!("{:x}", h.finalize());
+    out[..16].to_string()
+}
+
+/// 单项目活数据:滚动事件窗口 + 记忆 + 对话窗口
+pub struct ProjectLive {
+    /// 最近 200 条事件(内存镜像,与 events.log 同步)
+    pub events: VecDeque<NormalizedEvent>,
+    /// 项目全局记忆(None = 尚未生成)
+    pub facts: Option<Facts>,
+    /// 对话记忆:最近 3 条事件原始 JSON 截断副本(每条 ≤3KB),零 LLM 成本
+    pub dialog: VecDeque<String>,
+    /// 自上次增量精炼以来被消费的问题数(≥20 触发合并)
+    pub consumed_since_merge: u32,
+}
+
+impl ProjectLive {
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            facts: None,
+            dialog: VecDeque::new(),
+            consumed_since_merge: 0,
+        }
+    }
+}
+
+/// 本地 HTTP 端点信息(写入 endpoint.json 供适配器读取)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointInfo {
+    pub port: u16,
+    pub hello_token: String,
+    pub event_token: String,
+}
+
+/// 每日 LLM 预算快照
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DailyBudget {
+    pub date: String,
+    /// 今日请求已用次数
+    pub used: u64,
+    /// 今日被预算拒绝的次数(统计用)
+    pub rejected: u64,
+}
+
+impl Default for DailyBudget {
+    fn default() -> Self {
+        Self {
+            date: local_date(),
+            used: 0,
+            rejected: 0,
+        }
+    }
+}
+
+/// 今日日期(本地时区 yyyy-mm-dd)
+pub fn local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// 时间戳(秒)
+pub fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// 可串行访问的核心状态
+pub struct Core {
+    pub settings: Settings,
+    pub projects: HashMap<String, ProjectLive>,
+    /// 当前活动项目键(最近产生事件的项目)
+    pub active_project: Option<String>,
+    pub queue: VecDeque<Card>,
+    pub history: Vec<Card>,
+    pub cooldowns: CooldownMap,
+    pub budget: DailyBudget,
+    /// 门控决策日志(内存,同时滚动落盘)
+    pub decision_log: VecDeque<crate::gate::DecisionEntry>,
+    /// 近 10 分钟已问指纹(blake3 前缀) → 用于 G6 去重
+    pub recently_asked: VecDeque<(i64, String)>,
+    /// 距上次弹卡时间 (ts)
+    pub last_card_at: Option<i64>,
+    /// 今日总计:派发卡片数 / 用户回答数 / 不满意次数(成功度量)
+    pub stats: Stats,
+    /// 预算耗尽今日提示过(托盘气泡 once/day)
+    pub budget_toast_shown: bool,
+    /// 上次摄入事件时间(活性检测)
+    pub last_event_in: Option<i64>,
+    /// 被暂停(设置) / 胶囊隐藏标记
+    pub paused: bool,
+    pub capsule_hidden: bool,
+    /// 胶囊前端状态机(idle/active/popup)——仅记录
+    pub capsule_state: String,
+}
+
+pub struct Stats {
+    pub cards_created: u64,
+    pub answers: u64,
+    pub unsatisfied: u64,
+    pub total_today: String,
+}
+
+impl Core {
+    pub fn empty(settings: Settings) -> Self {
+        Self {
+            settings,
+            projects: HashMap::new(),
+            active_project: None,
+            queue: VecDeque::new(),
+            history: Vec::new(),
+            cooldowns: CooldownMap::default(),
+            budget: DailyBudget::default(),
+            decision_log: VecDeque::new(),
+            recently_asked: VecDeque::new(),
+            last_card_at: None,
+            stats: Stats {
+                cards_created: 0,
+                answers: 0,
+                unsatisfied: 0,
+                total_today: String::new(),
+            },
+            budget_toast_shown: false,
+            last_event_in: None,
+            paused: false,
+            capsule_hidden: false,
+            capsule_state: "idle".into(),
+        }
+    }
+
+    pub fn project_live(&mut self, path: &str) -> &mut ProjectLive {
+        let key = project_key(path);
+        self.projects.entry(key.clone()).or_insert_with(|| {
+            let live = ProjectLive::new();
+            live
+        })
+    }
+}
+
+/// 全局应用状态(Tauri manage 的是一份 Arc,供命令与 HTTP 任务共享)
+pub struct AppState {
+    pub core: CoreLock,
+    pub data_dir: PathBuf,
+    pub app: tauri::AppHandle,
+}
+
+impl AppState {
+    pub fn init(app: &tauri::AppHandle) -> anyhow::Result<Arc<Self>> {
+        let data_dir = app.path().app_data_dir()?;
+        std::fs::create_dir_all(&data_dir)?;
+
+        let settings = crate::settings::load_settings(&data_dir)?;
+
+        let state = Arc::new(Self {
+            core: CoreLock::from(Core::empty(settings)),
+            data_dir,
+            app: app.clone(),
+        });
+
+        crate::state::load_persisted(&state)?;
+        Ok(state)
+    }
+
+    /// 项目数据子目录
+    pub fn project_dir(&self, project_path: &str) -> PathBuf {
+        self.data_dir.join("projects").join(project_key(project_path))
+    }
+
+    pub fn ensure_project_dir(&self, project_path: &str) -> PathBuf {
+        let dir = self.project_dir(project_path);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+}
+
+/// 引擎向窗口广播事件的统一入口(保持事件名集中管理)
+pub fn emit(app: &tauri::AppHandle, event: &str, payload: &impl Serialize) {
+    let _ = app.emit(event, payload);
+}
+
+/// 管线快照(仅在 pipeline 内部使用;字段由同步段填充后逐段消费)
+pub struct PipelineSnapshot {
+    pub project_path: String,
+    pub now: i64,
+    pub batch: Vec<NormalizedEvent>,
+    pub queue_len: usize,
+    pub pending: Vec<crate::queue::Card>,
+    pub last_card_at: Option<i64>,
+    pub facts: Option<Facts>,
+    pub cooldowns: crate::queue::CooldownMap,
+    pub history: Vec<crate::queue::Card>,
+    pub last_event_id: String,
+}
+
+/// 持久化载入:settings/queue/cooldown/budget/facts(项目按需)
+pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let dir = &state.data_dir;
+    let mut core = state.core.blocking_lock();
+
+    core.settings = crate::settings::load_settings(dir)?;
+    core.paused = core.settings.paused;
+
+    // 队列与历史:queue.json 混存过队列+历史(旧版),这里按状态分流 + 按 id 去重
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(raw) = std::fs::read_to_string(dir.join("history.json")) {
+            if let Ok(cards) = serde_json::from_str::<Vec<Card>>(&raw) {
+                for c in cards {
+                    if seen.insert(c.id.clone()) {
+                        core.history.push(c);
+                    }
+                }
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(dir.join("queue.json")) {
+            if let Ok(list) = serde_json::from_str::<Vec<Card>>(&raw) {
+                for c in list {
+                    if !seen.insert(c.id.clone()) {
+                        continue;
+                    }
+                    if c.status == "pending" && now_ts() - c.created_at <= 2 * 3600 {
+                        core.queue.push_back(c);
+                    } else if c.status != "pending" {
+                        // 兼容旧版混存:非 pending 归档进历史
+                        core.history.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // 冷却矩阵
+    if let Ok(raw) = std::fs::read_to_string(dir.join("cooldown.json")) {
+        if let Ok(map) = serde_json::from_str::<CooldownMap>(&raw) {
+            core.cooldowns = map;
+        }
+    }
+
+    // 预算(跨日期自动归零)
+    if let Ok(raw) = std::fs::read_to_string(dir.join("budget.json")) {
+        if let Ok(b) = serde_json::from_str::<DailyBudget>(&raw) {
+            if b.date == local_date() {
+                core.budget = b;
+            }
+        }
+    }
+
+    // 决策日志(滚动 200)
+    if let Ok(raw) = std::fs::read_to_string(dir.join("decision-log.jsonl")) {
+        for line in raw.lines().take(200) {
+            if let Ok(e) = serde_json::from_str::<crate::gate::DecisionEntry>(line) {
+                core.decision_log.push_back(e);
+            }
+        }
+    }
+
+    // 项目事件恢复:重启后还原最近事件/对话窗口/facts/活动项目
+    // (保证"来一道"与记忆在重启后仍然可用)
+    let projects_dir = dir.join("projects");
+    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+        let mut newest: Option<(i64, String)> = None;
+        for entry in entries.flatten() {
+            let log = entry.path().join("events.log");
+            let Ok(raw) = std::fs::read_to_string(&log) else { continue };
+            let mut events: Vec<NormalizedEvent> = Vec::new();
+            for line in raw.lines().rev().take(200) {
+                if let Ok(ev) = serde_json::from_str::<NormalizedEvent>(line) {
+                    events.push(ev);
+                }
+            }
+            events.reverse();
+            if events.is_empty() {
+                continue;
+            }
+            let path = events.last().unwrap().project_path.clone();
+            let key = project_key(&path);
+            let mut live = ProjectLive::new();
+            for ev in events.iter().rev().take(3) {
+                let r = serde_json::to_string(ev).unwrap_or_default();
+                live.dialog.push_back(r.chars().take(3000).collect());
+            }
+            live.events = events.into_iter().collect();
+            if let Some(facts) = crate::memory::load_facts(&entry.path()) {
+                live.facts = Some(facts);
+            }
+            let ts = live.events.back().map(|e| e.ts).unwrap_or(0);
+            core.projects.insert(key, live);
+            if newest.as_ref().map(|(t, _)| ts > *t).unwrap_or(true) {
+                newest = Some((ts, path));
+            }
+        }
+        if let Some((_, path)) = newest {
+            core.active_project = Some(project_key(&path));
+        }
+    }
+
+    drop(core);
+    Ok(())
+}
+
+/// 持久化各文件(在变更点调用;自行加锁)
+pub fn save_core(state: &Arc<AppState>) {
+    let dir = state.data_dir.clone();
+    let core = state.core.blocking_lock();
+    save_core_locked(&dir, &core);
+}
+
+/// 无锁变体:调用方必须已持有 core 锁(否则死锁)
+pub fn save_core_locked(dir: &std::path::Path, core: &Core) {
+    let _ = crate::settings::save_settings(dir, &core.settings);
+    let _ = crate::queue::persist_queue(core, dir);
+    let _ = std::fs::write(
+        dir.join("cooldown.json"),
+        serde_json::to_string(&core.cooldowns).unwrap_or_default(),
+    );
+    let _ = std::fs::write(
+        dir.join("budget.json"),
+        serde_json::to_string(&core.budget).unwrap_or_default(),
+    );
+
+    // 决策日志滚动写
+    let entries: Vec<_> = core.decision_log.iter().collect();
+    let mut text = String::new();
+    for e in entries {
+        if let Ok(l) = serde_json::to_string(e) {
+            text.push_str(&l);
+            text.push('\n');
+        }
+    }
+    let _ = std::fs::write(dir.join("decision-log.jsonl"), text);
+}
+
+/// history_list:历史卡片列表 command 实现见 state 模块聚合
+pub fn history_list_inner(state: &Arc<AppState>) -> Vec<Card> {
+    state.core.blocking_lock().history.clone()
+}
+
+/// facts_get 返回值由 frontend 展示
+#[tauri::command]
+pub fn history_list(state: tauri::State<'_, Arc<AppState>>) -> Vec<Card> {
+    history_list_inner(&state)
+}
+
+#[tauri::command]
+pub fn endpoint_info(state: tauri::State<'_, Arc<AppState>>) -> EndpointInfo {
+    let path = state.data_dir.join("endpoint.json");
+    let _ = path;
+    let info = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|x| serde_json::from_str::<EndpointInfo>(&x).ok());
+    info.unwrap_or(EndpointInfo {
+        port: 0,
+        hello_token: String::new(),
+        event_token: String::new(),
+    })
+}
+
+#[tauri::command]
+pub fn facts_get(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json::Value> {
+    let core = state.core.blocking_lock();
+    if let Some(key) = &core.active_project {
+        if let Some(live) = core.projects.get(key) {
+            return live.facts.as_ref().map(|f| serde_json::to_value(f).ok()).flatten();
+        }
+    }
+    None
+}
+
+/// 运行统计(设置面板诊断:适配器是否在打通)
+#[tauri::command]
+pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
+    let core = state.core.blocking_lock();
+    serde_json::json!({
+        "lastEventIn": core.last_event_in,
+        "activeProject": core.active_project.as_ref().map(|k| {
+            core.projects.get(k).and_then(|p| p.events.back().map(|e| e.project_path.clone()))
+        }).flatten().unwrap_or_default(),
+        "cardsCreated": core.stats.cards_created,
+        "answers": core.stats.answers,
+        "unsatisfied": core.stats.unsatisfied,
+    })
+}
