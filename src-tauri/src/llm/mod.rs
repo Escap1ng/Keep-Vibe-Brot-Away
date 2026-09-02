@@ -430,8 +430,8 @@ mod tests {
 
     #[test]
     fn parse_contract_string_with_braces_and_escapes() {
-        // 字符串值内含 } 与转义引号;后面还跟着干扰对象
-        let text = r#"prefix {"text":"a } b \"quoted\""} trailing {"type":"junk"}"#;
+        // 字符串值内含 } 与转义引号 \"(JSON 合法转义);后面还跟着残缺的干扰对象
+        let text = r#"prefix {"type":"tips","severity":"info","theme":"","text":"a } b \"quoted\""} trailing {"type":"junk"}"#;
         let out = parse_contract(text).expect("应取首个平衡对象");
         assert_eq!(out.text, "a } b \"quoted\"");
         assert!(out.theme.is_empty());
