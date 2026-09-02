@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Users\\admin\\kvba\\kvba-claude-bridge.exe",
+            "command": "<替换为你的绝对路径>\\kvba-claude-bridge.exe",
             "timeout": 3,
             "async": true
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Users\\admin\\kvba\\kvba-claude-bridge.exe",
+            "command": "<替换为你的绝对路径>\\kvba-claude-bridge.exe",
             "timeout": 3,
             "async": true
           }
