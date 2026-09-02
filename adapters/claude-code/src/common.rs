@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn build_event_schema_and_fields() {
-        let ev = build_event("test", "tool.completed", "edit", vec!["a.ts"], "+x", "编辑 a.ts", false, false, false, 1, "C:/p", "s1");
+        let ev = build_event("test", "tool.completed", "edit", vec!["a.ts".to_string()], "+x", "编辑 a.ts", false, false, false, 1, "C:/p", "s1");
         assert_eq!(ev["schema"], "kvba.event.v1");
         assert_eq!(ev["emitter"], "test");
         assert_eq!(ev["projectPath"], "C:/p");
