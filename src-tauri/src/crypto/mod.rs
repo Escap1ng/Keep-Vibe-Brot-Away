@@ -35,6 +35,19 @@ pub fn machine_id() -> String {
     }
     #[cfg(target_os = "macos")]
     {
+        // IOPlatformUUID(ioreg);失败回退 hostname
+        if let Ok(out) = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(pos) = s.find("IOPlatformUUID") {
+                // 形如: IOPlatformUUID = "XXXXXXXX-XXXX-…"
+                if let Some(v) = s[pos..].split('"').nth(1) {
+                    return v.to_string();
+                }
+            }
+        }
         std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "mac-unknown".into())
     }
     #[cfg(target_os = "linux")]

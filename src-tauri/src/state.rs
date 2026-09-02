@@ -8,6 +8,8 @@
 //! ├─ queue.json           待答队列 + 历史
 //! ├─ cooldown.json        主题冷却矩阵
 //! ├─ budget.json          当日 LLM 调用预算快照
+//! ├─ stats.json           运行统计(当日 + 历史累计)
+//! ├─ batch.json           攒批缓冲(预算耗尽时暂存的门控通过项)
 //! ├─ decision-log.jsonl   门控决策日志(滚动 200 条)
 //! ├─ endpoint.json        本地 HTTP 端点信息(端口 + 握手 token)
 //! └─ projects/<sha256(path)[..16]>/
@@ -113,6 +115,17 @@ pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// 攒批项:门控通过(G1-G6)但 G7 预算耗尽时暂存的上下文快照,
+/// 待额度恢复(次日或当日腾出)后由维护任务补发分析。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchItem {
+    pub pass: crate::gate::GatePass,
+    pub project_path: String,
+    pub ref_event_id: String,
+    pub created_at: i64,
+}
+
 /// 可串行访问的核心状态
 pub struct Core {
     pub settings: Settings,
@@ -125,11 +138,11 @@ pub struct Core {
     pub budget: DailyBudget,
     /// 门控决策日志(内存,同时滚动落盘)
     pub decision_log: VecDeque<crate::gate::DecisionEntry>,
-    /// 近 10 分钟已问指纹(blake3 前缀) → 用于 G6 去重
-    pub recently_asked: VecDeque<(i64, String)>,
+    /// 攒批缓冲(预算耗尽时累计,恢复后消费)
+    pub pending_batch: Vec<BatchItem>,
     /// 距上次弹卡时间 (ts)
     pub last_card_at: Option<i64>,
-    /// 今日总计:派发卡片数 / 用户回答数 / 不满意次数(成功度量)
+    /// 今日总计:派发卡片数 / 用户回答数 / 不满意次数(成功度量,落盘持久)
     pub stats: Stats,
     /// 预算耗尽今日提示过(托盘气泡 once/day)
     pub budget_toast_shown: bool,
@@ -142,11 +155,46 @@ pub struct Core {
     pub capsule_state: String,
 }
 
+/// 运行统计(§1.5 成功度量的本地埋点):当日计数 + 历史累计,持久化到 stats.json
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Stats {
+    /// 当日计数所属日期(跨日 roll 时并入累计并清零)
+    pub date: String,
     pub cards_created: u64,
     pub answers: u64,
     pub unsatisfied: u64,
-    pub total_today: String,
+    pub total_cards_created: u64,
+    pub total_answers: u64,
+    pub total_unsatisfied: u64,
+}
+
+impl Stats {
+    pub fn today() -> Self {
+        Self {
+            date: local_date(),
+            cards_created: 0,
+            answers: 0,
+            unsatisfied: 0,
+            total_cards_created: 0,
+            total_answers: 0,
+            total_unsatisfied: 0,
+        }
+    }
+
+    /// 若日期已变更:当日计数并入累计,当日清零
+    pub fn roll_to_today(&mut self) {
+        let today = local_date();
+        if self.date != today {
+            self.total_cards_created += self.cards_created;
+            self.total_answers += self.answers;
+            self.total_unsatisfied += self.unsatisfied;
+            self.cards_created = 0;
+            self.answers = 0;
+            self.unsatisfied = 0;
+            self.date = today;
+        }
+    }
 }
 
 impl Core {
@@ -160,14 +208,9 @@ impl Core {
             cooldowns: CooldownMap::default(),
             budget: DailyBudget::default(),
             decision_log: VecDeque::new(),
-            recently_asked: VecDeque::new(),
+            pending_batch: Vec::new(),
             last_card_at: None,
-            stats: Stats {
-                cards_created: 0,
-                answers: 0,
-                unsatisfied: 0,
-                total_today: String::new(),
-            },
+            stats: Stats::today(),
             budget_toast_shown: false,
             last_event_in: None,
             paused: false,
@@ -293,9 +336,27 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
-    // 决策日志(滚动 200)
+    // 运行统计(载入后先做跨日归并:昨日计数并入累计)
+    if let Ok(raw) = std::fs::read_to_string(dir.join("stats.json")) {
+        if let Ok(s) = serde_json::from_str::<Stats>(&raw) {
+            core.stats = s;
+            core.stats.roll_to_today();
+        }
+    }
+
+    // 攒批缓冲(丢弃超过 24h 的陈旧项)
+    if let Ok(raw) = std::fs::read_to_string(dir.join("batch.json")) {
+        if let Ok(list) = serde_json::from_str::<Vec<BatchItem>>(&raw) {
+            let now = now_ts();
+            core.pending_batch = list.into_iter().filter(|b| now - b.created_at < 24 * 3600).collect();
+        }
+    }
+
+    // 决策日志(滚动 200,取最近 200 行)
     if let Ok(raw) = std::fs::read_to_string(dir.join("decision-log.jsonl")) {
-        for line in raw.lines().take(200) {
+        let lines: Vec<&str> = raw.lines().collect();
+        let start = lines.len().saturating_sub(200);
+        for line in &lines[start..] {
             if let Ok(e) = serde_json::from_str::<crate::gate::DecisionEntry>(line) {
                 core.decision_log.push_back(e);
             }
@@ -365,6 +426,14 @@ pub fn save_core_locked(dir: &std::path::Path, core: &Core) {
         dir.join("budget.json"),
         serde_json::to_string(&core.budget).unwrap_or_default(),
     );
+    let _ = std::fs::write(
+        dir.join("stats.json"),
+        serde_json::to_string(&core.stats).unwrap_or_default(),
+    );
+    let _ = std::fs::write(
+        dir.join("batch.json"),
+        serde_json::to_string(&core.pending_batch).unwrap_or_default(),
+    );
 
     // 决策日志滚动写
     let entries: Vec<_> = core.decision_log.iter().collect();
@@ -414,10 +483,20 @@ pub fn facts_get(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json::V
     None
 }
 
-/// 运行统计(设置面板诊断:适配器是否在打通)
+/// 运行统计(设置面板诊断:适配器是否在打通 + §1.5 成功度量本地埋点)
 #[tauri::command]
 pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
-    let core = state.core.blocking_lock();
+    let mut core = state.core.blocking_lock();
+    // 读取时顺带跨日归并(避免隔夜仍显示昨日"当日"计数)
+    let rolled = core.stats.date != local_date();
+    core.stats.roll_to_today();
+    if rolled {
+        let _ = std::fs::write(
+            state.data_dir.join("stats.json"),
+            serde_json::to_string(&core.stats).unwrap_or_default(),
+        );
+    }
+    let rate = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
     serde_json::json!({
         "lastEventIn": core.last_event_in,
         "activeProject": core.active_project.as_ref().map(|k| {
@@ -426,5 +505,44 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
         "cardsCreated": core.stats.cards_created,
         "answers": core.stats.answers,
         "unsatisfied": core.stats.unsatisfied,
+        "todayAnswerRate": rate(core.stats.answers, core.stats.cards_created),
+        "total": {
+            "cardsCreated": core.stats.total_cards_created,
+            "answers": core.stats.total_answers,
+            "unsatisfied": core.stats.total_unsatisfied,
+            "answerRate": rate(core.stats.total_answers, core.stats.total_cards_created),
+        },
+        "batched": core.pending_batch.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_roll_merges_day_change_only_once() {
+        let mut s = Stats::today();
+        s.cards_created = 5;
+        s.answers = 2;
+        s.unsatisfied = 1;
+        // 伪造为旧日期 → roll 后当日清零、累计并入
+        s.date = "2000-01-01".into();
+        s.roll_to_today();
+        assert_eq!(s.cards_created, 0);
+        assert_eq!(s.total_cards_created, 5);
+        assert_eq!(s.total_answers, 2);
+        assert_eq!(s.total_unsatisfied, 1);
+        assert_eq!(s.date, local_date());
+        // 同日重复 roll 不重复计数
+        s.roll_to_today();
+        assert_eq!(s.total_cards_created, 5);
+    }
+
+    #[test]
+    fn project_key_stable_and_isolating() {
+        assert_eq!(project_key("C:/proj/foo"), project_key("C:/proj/foo"));
+        assert_ne!(project_key("C:/proj/foo"), project_key("C:/proj/bar"));
+        assert_eq!(project_key("x").len(), 16);
+    }
 }
