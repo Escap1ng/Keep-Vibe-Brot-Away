@@ -41,7 +41,11 @@ fn panel_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 
 /// 圆点所在显示器的物理边界(x, y, w, h);失败回退主显示器
 fn dot_monitor_bounds(dot: &tauri::WebviewWindow) -> (i64, i64, i64, i64) {
-    let mon = dot.current_monitor().ok().flatten().or_else(|| dot.primary_monitor().ok().flatten());
+    let mon = dot
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| dot.primary_monitor().ok().flatten());
     if let Some(m) = mon {
         let p = m.position();
         let s = m.size();
@@ -49,6 +53,105 @@ fn dot_monitor_bounds(dot: &tauri::WebviewWindow) -> (i64, i64, i64, i64) {
     } else {
         (0, 0, 1920, 1080)
     }
+}
+
+/// 圆点真实物理尺寸;取不到 outer_size 时按 DPI 换算逻辑尺寸兜底
+fn dot_size(dot: &tauri::WebviewWindow) -> (i64, i64) {
+    match window_box(dot) {
+        Some(b) => (b.w, b.h),
+        None => {
+            let scale = dot.scale_factor().unwrap_or(1.0);
+            ((DOT_LOGICAL * scale) as i64, (DOT_LOGICAL * scale) as i64)
+        }
+    }
+}
+
+/// 显示器可见工作区(物理像素)
+#[derive(Clone, Copy)]
+struct WorkArea {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+impl WorkArea {
+    /// 圆点矩形是否完整落在本工作区内
+    fn contains(&self, x: i64, y: i64, w: i64, h: i64) -> bool {
+        x >= self.x && y >= self.y && x + w <= self.x + self.w && y + h <= self.y + self.h
+    }
+
+    /// 把圆点整体钳进本工作区(保证四边不出界、完整可点)
+    fn clamp(&self, x: i64, y: i64, w: i64, h: i64) -> (i64, i64) {
+        (
+            x.clamp(self.x, (self.x + self.w - w).max(self.x)),
+            y.clamp(self.y, (self.y + self.h - h).max(self.y)),
+        )
+    }
+
+    /// 圆点到本工作区的最短间隙平方(用于挑"最近的一块屏")
+    fn gap_sq(&self, x: i64, y: i64, w: i64, h: i64) -> i64 {
+        let dx = (self.x - (x + w)).max(x - (self.x + self.w)).max(0);
+        let dy = (self.y - (y + h)).max(y - (self.y + self.h)).max(0);
+        dx * dx + dy * dy
+    }
+}
+
+fn work_areas(app: &AppHandle) -> Vec<WorkArea> {
+    let Ok(monitors) = app.available_monitors() else {
+        return vec![];
+    };
+    monitors
+        .iter()
+        .map(|m| {
+            let p = m.position();
+            let s = m.size();
+            WorkArea {
+                x: p.x as i64,
+                y: p.y as i64,
+                w: s.width as i64,
+                h: s.height as i64,
+            }
+        })
+        .collect()
+}
+
+/// 把停靠坐标钳回可见工作区。
+/// 保存的坐标可能来自已拔掉的第二块屏或改过的 DPI;一旦落在所有显示器之外,
+/// 胶囊看不见就再也拖不回来 —— 所以启动/唤起路径必须自愈(纠正值由调用方回写盘)。
+fn clamp_dock(app: &AppHandle, x: i64, y: i64) -> (i64, i64) {
+    let areas = work_areas(app);
+    // 拿不到显示器信息时原样交回,好过瞎猜一个位置
+    if areas.is_empty() {
+        return (x, y);
+    }
+    let Some(dot) = dot_window(app) else {
+        return (x, y);
+    };
+    let (w, h) = dot_size(&dot);
+    let (cx, cy) = pick_dock(&areas, x, y, w, h);
+    if (cx, cy) != (x, y) {
+        log::info!(
+            "胶囊停靠位 ({x},{y}) 已不在任何显示器工作区内,纠正为 ({cx},{cy});当前工作区={:?}",
+            areas
+                .iter()
+                .map(|a| (a.x, a.y, a.w, a.h))
+                .collect::<Vec<_>>()
+        );
+    }
+    (cx, cy)
+}
+
+/// 纯几何:已完整可见则原样返回;否则整体钳进离它最近的那块工作区
+fn pick_dock(areas: &[WorkArea], x: i64, y: i64, w: i64, h: i64) -> (i64, i64) {
+    let Some(target) = areas
+        .iter()
+        .find(|a| a.contains(x, y, w, h))
+        .or_else(|| areas.iter().min_by_key(|a| a.gap_sq(x, y, w, h)))
+    else {
+        return (x, y);
+    };
+    target.clamp(x, y, w, h)
 }
 
 /// 读取保存的停靠坐标(找不到 → None)
@@ -62,14 +165,10 @@ pub fn saved_dock(state: &Arc<AppState>) -> Option<(i64, i64)> {
 
 /// 胶囊默认位置:主显示器右缘中部(按真实物理尺寸计算)
 fn default_dock(app: &AppHandle) -> (i64, i64) {
-    let Some(dot) = dot_window(app) else { return (1800, 400) };
-    let (w, h) = match window_box(&dot) {
-        Some(b) => (b.w, b.h),
-        None => {
-            let scale = dot.scale_factor().unwrap_or(1.0);
-            ((DOT_LOGICAL * scale) as i64, (DOT_LOGICAL * scale) as i64)
-        }
+    let Some(dot) = dot_window(app) else {
+        return (1800, 400);
     };
+    let (w, h) = dot_size(&dot);
     if let Ok(Some(mon)) = app.primary_monitor() {
         let size = mon.size();
         let (mw, mh) = (size.width as i64, size.height as i64);
@@ -79,10 +178,11 @@ fn default_dock(app: &AppHandle) -> (i64, i64) {
     }
 }
 
-/// 启动时定位胶囊
+/// 启动时定位胶囊(越界的持久化坐标会被 clamp_dock 纠正,并由 apply_dock_position 回写)
 pub fn initial_position(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>();
     let (x, y) = saved_dock(&state).unwrap_or_else(|| default_dock(app));
+    let (x, y) = clamp_dock(app, x, y);
     apply_dock_position(app, x, y);
 }
 
@@ -104,22 +204,10 @@ pub fn apply_dock_position(app: &AppHandle, x: i64, y: i64) {
 
 /// 拖拽落点吸附:贴近屏幕边缘(阈值 24px)则咬合,并钳制在圆点所在显示器内
 #[tauri::command]
-pub fn dock_snap(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AppState>>,
-    x: i64,
-    y: i64,
-) -> Result<(i64, i64), String> {
-    let _ = state;
+pub fn dock_snap(app: tauri::AppHandle, x: i64, y: i64) -> Result<(i64, i64), String> {
     let dot = dot_window(&app).ok_or("胶囊窗口不存在")?;
     let (mx, my, mw, mh) = dot_monitor_bounds(&dot);
-    let (dw, dh) = match window_box(&dot) {
-        Some(b) => (b.w, b.h),
-        None => {
-            let scale = dot.scale_factor().unwrap_or(1.0);
-            ((DOT_LOGICAL * scale) as i64, (DOT_LOGICAL * scale) as i64)
-        }
-    };
+    let (dw, dh) = dot_size(&dot);
 
     let mut nx = x;
     let mut ny = y;
@@ -142,9 +230,11 @@ pub fn dock_snap(
 }
 
 /// 面板窗口锚定于胶囊停靠位置:
+///
 /// - 圆点在屏幕右半侧 → 面板向左展开(面板右缘对齐圆点右缘);
 /// - 圆点在左半侧 → 向右展开;
 /// - 全程按真实物理尺寸钳制在圆点所在显示器边界内,绝不越出屏幕。
+///
 /// mode: "active"(新卡到达)| "popup"(点胶囊)
 pub fn show_panel(app: &AppHandle) {
     show_panel_mode(app, "active");
@@ -155,7 +245,9 @@ pub fn show_panel_mode(app: &AppHandle, mode: &str) {
         return;
     };
     let Some(dot) = dot_window(app) else { return };
-    let Some(panel) = panel_window(app) else { return };
+    let Some(panel) = panel_window(app) else {
+        return;
+    };
 
     let (dx, dy) = saved_dock(&state).unwrap_or_else(|| default_dock(app));
     let dot_box = window_box(&dot).unwrap_or(WinBox { w: 64, h: 64 });
@@ -188,9 +280,7 @@ pub fn show_panel_mode(app: &AppHandle, mode: &str) {
 
     let _ = panel.set_position(PhysicalPosition::new(px as i32, py as i32));
     let _ = panel.show();
-    if let Some(d) = dot_window(app) {
-        let _ = d.hide();
-    }
+    let _ = dot.hide();
     let _ = app.emit("panel:show", serde_json::json!({ "mode": mode }));
 }
 
@@ -224,6 +314,17 @@ pub fn protect_windows_from_close(app: &AppHandle) {
     }
 }
 
+/// 记录胶囊显隐意图(运行期标志 + 设置项);启动时始终复位为显示
+fn set_capsule_hidden(app: &AppHandle, hidden: bool) {
+    let Some(state) = app.try_state::<Arc<AppState>>().map(|s| s.inner().clone()) else {
+        return;
+    };
+    let mut core = state.core.blocking_lock();
+    core.capsule_hidden = hidden;
+    core.settings.capsule_hidden = hidden;
+    let _ = crate::settings::save_settings(&state.data_dir, &core.settings);
+}
+
 /// 隐藏胶囊(仅托盘图标)
 pub fn hide_capsule(app: &AppHandle) {
     for label in ["capsule-dot", "capsule-panel"] {
@@ -231,34 +332,21 @@ pub fn hide_capsule(app: &AppHandle) {
             let _ = w.hide();
         }
     }
-    if let Some(state) = app.try_state::<Arc<AppState>>() {
-        let state = state.inner().clone();
-        let mut core = state.core.blocking_lock();
-        core.capsule_hidden = true;
-        core.settings.capsule_hidden = true;
-        let _ = crate::settings::save_settings(&state.data_dir, &core.settings);
-        drop(core);
-    }
+    set_capsule_hidden(app, true);
 }
 
-/// 恢复胶囊
+/// 恢复胶囊(回到上次停靠位置;越界坐标同样会被纠正)
 pub fn show_capsule(app: &AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         let state = state.inner().clone();
         let (x, y) = saved_dock(&state).unwrap_or_else(|| default_dock(app));
+        let (x, y) = clamp_dock(app, x, y);
         apply_dock_position(app, x, y);
     }
     if let Some(dot) = dot_window(app) {
         let _ = dot.show();
     }
-    if let Some(state) = app.try_state::<Arc<AppState>>() {
-        let state = state.inner().clone();
-        let mut core = state.core.blocking_lock();
-        core.capsule_hidden = false;
-        core.settings.capsule_hidden = false;
-        let _ = crate::settings::save_settings(&state.data_dir, &core.settings);
-        drop(core);
-    }
+    set_capsule_hidden(app, false);
 }
 
 /// 设置窗口(打开即用)
@@ -268,17 +356,6 @@ pub fn open_settings(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     }
-}
-
-/// 胶囊状态上报(前端状态机:idle/active/popup)——仅记录,不控制行为
-#[tauri::command]
-pub fn capsule_set_state(
-    state: tauri::State<'_, Arc<AppState>>,
-    capsule_state: String,
-) -> Result<(), String> {
-    let mut core = state.core.blocking_lock();
-    core.capsule_state = capsule_state;
-    Ok(())
 }
 
 /// 开/关面板(供前端调用);mode: active|popup
@@ -310,4 +387,58 @@ pub fn capsule_show(app: tauri::AppHandle) -> Result<(), String> {
 pub fn settings_open(app: tauri::AppHandle) -> Result<(), String> {
     open_settings(&app);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(x: i64, y: i64, w: i64, h: i64) -> WorkArea {
+        WorkArea { x, y, w, h }
+    }
+
+    /// 现场复现:拔屏后遗留的 dockX=2358 落在 1707 宽的单屏之外
+    #[test]
+    fn off_screen_dock_is_pulled_back_inside_the_monitor() {
+        let areas = [area(0, 0, 1707, 1067)];
+        let (x, y) = pick_dock(&areas, 2358, 860, 72, 72);
+        assert_eq!(x, 1707 - 72, "应贴到右缘内侧,保证圆点完整可见");
+        assert_eq!(y, 860, "纵向本就合规,不得被改动");
+    }
+
+    #[test]
+    fn visible_dock_is_left_untouched() {
+        let areas = [area(0, 0, 1920, 1080)];
+        assert_eq!(pick_dock(&areas, 1848, 512, 48, 48), (1848, 512));
+    }
+
+    #[test]
+    fn negative_and_over_bottom_coords_are_clamped() {
+        let areas = [area(0, 0, 1920, 1080)];
+        assert_eq!(pick_dock(&areas, -400, -20, 48, 48), (0, 0));
+        assert_eq!(pick_dock(&areas, 900, 5000, 48, 48), (900, 1080 - 48));
+    }
+
+    /// 多屏时回到"最近的那块",而不是随机挑一块(副屏在负 X 方向很常见)
+    #[test]
+    fn nearest_monitor_wins_on_multi_monitor_rigs() {
+        let areas = [area(0, 0, 1920, 1080), area(-1920, 0, 1920, 1200)];
+        let (x, y) = pick_dock(&areas, -3000, 700, 48, 48);
+        assert_eq!((x, y), (-1920, 700), "应吸附到副屏左缘");
+        let (x2, y2) = pick_dock(&areas, 4000, 700, 48, 48);
+        assert_eq!((x2, y2), (1920 - 48, 700), "主屏侧出界则吸附主屏右缘");
+    }
+
+    /// 拔屏 + 高 DPI:圆点物理尺寸可能大于新工作区,仍须给出可见(左上对齐)结果而非 panic
+    #[test]
+    fn dot_larger_than_work_area_does_not_panic_or_disappear() {
+        let areas = [area(0, 0, 640, 480)];
+        let (x, y) = pick_dock(&areas, 5000, 5000, 800, 800);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    #[test]
+    fn empty_monitor_list_leaves_coordinate_alone() {
+        assert_eq!(pick_dock(&[], 2358, 860, 72, 72), (2358, 860));
+    }
 }

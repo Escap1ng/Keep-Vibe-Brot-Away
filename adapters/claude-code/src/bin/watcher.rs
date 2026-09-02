@@ -10,13 +10,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kvba_adapters::common::{build_event, scan_flags};
+use kvba_adapters::common::{build_event, collect_files, scan_flags, EventSpec};
 use kvba_adapters::post_event;
 
 fn main() {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     let claude_dir = std::env::var("KVBA_CLAUDEDIR").unwrap_or_else(|_| format!("{home}/.claude"));
-    let interval_ms: u64 = std::env::var("KVBA_WATCH_INTERVAL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+    let interval_ms: u64 = std::env::var("KVBA_WATCH_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
 
     let projects_dir = PathBuf::from(&claude_dir).join("projects");
     // 每文件独立偏移:path → offset
@@ -44,7 +49,11 @@ fn main() {
     }
 }
 
-fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>, cwd_cache: &mut HashMap<PathBuf, String>) {
+fn tail_file(
+    path: &Path,
+    offsets: &mut HashMap<PathBuf, u64>,
+    cwd_cache: &mut HashMap<PathBuf, String>,
+) {
     let Ok(meta) = fs::metadata(path) else { return };
     let len = meta.len();
     let offset = offsets.entry(path.to_path_buf()).or_insert(0);
@@ -89,8 +98,12 @@ fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>, cwd_cache: &mut H
 }
 
 fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, String>) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-    let Some(msg) = v["message"].as_object() else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(msg) = v["message"].as_object() else {
+        return;
+    };
     let session_id = v["sessionId"].as_str().unwrap_or("").to_string();
     // 项目路径:转录行自带 cwd 字段(权威来源);缺失时用本文件已缓存的 cwd;
     // 两者都没有则放弃该事件,绝不猜测路径(避免把事件归错项目)。
@@ -105,7 +118,9 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
         return;
     }
 
-    let Some(content) = msg["content"].as_array() else { return };
+    let Some(content) = msg["content"].as_array() else {
+        return;
+    };
     for part in content {
         if part["type"] == "tool_use" {
             let tool_name = part["name"].as_str().unwrap_or("").to_string();
@@ -113,17 +128,7 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
                 continue;
             }
             let input = part["input"].clone();
-            let mut files: Vec<String> = Vec::new();
-            if let Some(fp) = input["file_path"].as_str() {
-                files.push(fp.to_string());
-            }
-            if let Some(list) = input["file_paths"].as_array() {
-                for p in list {
-                    if let Some(p) = p.as_str() {
-                        files.push(p.to_string());
-                    }
-                }
-            }
+            let files = collect_files(&input);
             let mut intent = String::new();
             if let Some(cmd) = input["command"].as_str() {
                 intent = format!("$ {cmd}");
@@ -147,20 +152,18 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
                 }
             }
             let flags = scan_flags(&intent, &diff);
-            let ev = build_event(
-                "claude-code-watcher",
-                "tool.completed",
-                &tool_name,
+            let ev = build_event(EventSpec {
+                emitter: "claude-code-watcher",
+                event_type: "tool.completed",
+                tool_name: &tool_name,
                 files,
-                &diff,
-                &intent,
-                flags.has_api_call,
-                flags.has_error_path,
-                flags.todo_or_fixme,
-                diff.lines().count() as i64,
-                &cwd,
-                &session_id,
-            );
+                diff_head: &diff,
+                intent: &intent,
+                flags,
+                line_delta: diff.lines().count() as i64,
+                project_path: &cwd,
+                session_id: &session_id,
+            });
             let _ = post_event(&ev);
         }
     }

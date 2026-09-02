@@ -1,10 +1,20 @@
 <script setup lang="ts">
 // 设置/历史/决策日志(三合一窗口,用完即关)
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { api } from "../lib/api";
-import type { BudgetInfo, Card, DecisionEntry, Facts, Settings } from "../lib/types";
+import { DEFAULT_DAILY_BUDGET, PROMPT_PENDING_MARK } from "../lib/types";
+import type {
+  BudgetInfo,
+  Card,
+  DecisionEntry,
+  Facts,
+  Settings,
+  StatsInfo,
+} from "../lib/types";
 
-const tab = ref<"settings" | "history" | "log">("settings");
+type TabId = "settings" | "history" | "log";
+
+const tab = ref<TabId>("settings");
 
 const s = ref<Settings | null>(null);
 const keys = ref<Record<string, string>>({ openai: "", google: "", anthropic: "" });
@@ -21,7 +31,7 @@ const tabs = [
 
 const history = ref<Card[]>([]);
 const decisions = ref<DecisionEntry[]>([]);
-const stats = ref<Awaited<ReturnType<typeof api.statsInfo>> | null>(null);
+const stats = ref<StatsInfo | null>(null);
 
 let msgTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -50,27 +60,38 @@ async function loadAll() {
 }
 
 async function loadHistory() {
-  history.value = await api.historyList();
+  history.value = await api.historyList().catch(() => [] as Card[]);
 }
 async function loadDecisions() {
-  decisions.value = await api.decisionLogList();
+  decisions.value = await api.decisionLogList().catch(() => [] as DecisionEntry[]);
 }
+
+// 历史/决策日志是过程性数据,窗口开着时也在变 → 每次切到对应 Tab 都重新拉取
+watch(tab, async (next) => {
+  if (next === "history") await loadHistory();
+  else if (next === "log") await loadDecisions();
+});
 
 async function save() {
   if (!s.value) return;
-  await api.settingsPut({
-    provider: s.value.provider,
-    model: s.value.model,
-    baseUrl: s.value.baseUrl || null,
-    dailyBudget: Number(s.value.dailyBudget) || 80,
-    autostart: !!s.value.autostart,
-    p0ReplaceQueue: !!s.value.p0ReplaceQueue,
-    paused: !!s.value.paused,
-  });
-  for (const [p, k] of Object.entries(keys.value)) {
-    if (k) await api.secretsPut(p, k);
+  const src = s.value;
+  try {
+    await api.settingsPut({
+      provider: src.provider,
+      model: src.model,
+      baseUrl: src.baseUrl || null,
+      dailyBudget: Number(src.dailyBudget) || DEFAULT_DAILY_BUDGET,
+      autostart: !!src.autostart,
+      p0ReplaceQueue: !!src.p0ReplaceQueue,
+      paused: !!src.paused,
+    });
+    for (const [provider, key] of Object.entries(keys.value)) {
+      if (key) await api.secretsPut(provider, key);
+    }
+    noteSaved("已保存");
+  } catch (e) {
+    noteSaved(`保存失败:${String(e)}`);
   }
-  noteSaved("已保存");
   await loadAll();
 }
 
@@ -175,7 +196,7 @@ onMounted(async () => {
             step="1"
             class="ctrl narrow"
           />
-          <span class="hint">已用 {{ budget?.used ?? 0 }}/{{ budget?.limit ?? 80 }} 次</span>
+          <span class="hint">已用 {{ budget?.used ?? 0 }}/{{ budget?.limit ?? DEFAULT_DAILY_BUDGET }} 次</span>
         </label>
         <label class="row switch-row">
           <span>暂停提问</span>
@@ -224,7 +245,7 @@ onMounted(async () => {
         </div>
         <p class="h-text">{{ c.text }}</p>
         <p class="h-answer">你的答复:{{ c.answer || "—" }}</p>
-        <template v-if="c.optimizedPrompt && c.optimizedPrompt !== '(生成中)'">
+        <template v-if="c.optimizedPrompt && c.optimizedPrompt !== PROMPT_PENDING_MARK">
           <div class="h-prompts">
             <code class="h-prompt">{{ c.optimizedPrompt }}</code>
             <button class="kvba-btn text copy-btn" @click="copyText(c.optimizedPrompt)">复制</button>

@@ -11,6 +11,9 @@ interface Endpoint {
 }
 
 const SCHEMA = "kvba.event.v1";
+// 与服务端 events::sanitize 的截断口径保持一致(超出的服务端会再截一次)
+const MAX_DIFF_CHARS = 6000;
+const MAX_INTENT_CHARS = 500;
 
 /** 读取 KVBA 端点信息(KVBA 数据目录) */
 function readEndpoint(): Endpoint | null {
@@ -155,26 +158,27 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
     todo: boolean,
     lineDelta: number,
   ) {
-    if (!ensureEndpoint()) return;
-    const excerpt = {
-      files,
-      diffHead: diffHead.slice(0, 6000),
-      intent: intent.slice(0, 500),
-      hasErrorPath: isError,
-      hasApiCall: isApi,
-      todoOrFixme: todo,
-      lineDelta,
-    };
-    void postEvent(endpoint!, {
+    const ep = ensureEndpoint();
+    if (!ep) return;
+    const ts = nowMs();
+    void postEvent(ep, {
       schema: SCHEMA,
-      id: fnv16(`${eventType}|${tool}|${nowMs()}|${intent.slice(0, 40)}`),
+      id: fnv16(`${eventType}|${tool}|${ts}|${intent.slice(0, 40)}`),
       emitter: "opencode-plugin",
       eventType,
       toolName: tool,
-      ts: nowMs(),
+      ts,
       projectPath: sessionProject,
       sessionId: "",
-      excerpt,
+      excerpt: {
+        files,
+        diffHead: diffHead.slice(0, MAX_DIFF_CHARS),
+        intent: intent.slice(0, MAX_INTENT_CHARS),
+        hasErrorPath: isError,
+        hasApiCall: isApi,
+        todoOrFixme: todo,
+        lineDelta,
+      },
     });
   }
 
@@ -201,16 +205,37 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
             ? content.slice(0, 300)
             : `执行 ${tool}`;
 
-      const flags = scanFlags(intent + " " + src);
+      const flags = scanFlags(`${intent} ${src}`);
       // 空内容不计行数(避免 "".split("\n") 得出虚高 1)
-      const lineDelta = diff || content ? (diff || content).split("\n").length : 0;
-      emit("tool.completed", tool, files, diff || content.slice(0, 6000), intent, flags.hasErrorPath, flags.hasApiCall, flags.todoOrFixme, tool === "bash" ? 0 : lineDelta);
+      const body = diff || content;
+      const lineDelta = body ? body.split("\n").length : 0;
+      emit(
+        "tool.completed",
+        tool,
+        files,
+        body.slice(0, MAX_DIFF_CHARS),
+        intent,
+        flags.hasErrorPath,
+        flags.hasApiCall,
+        flags.todoOrFixme,
+        tool === "bash" ? 0 : lineDelta,
+      );
 
       // opencode 的 bash 输出错误(excerpt 摘录)
       if (tool === "bash") {
-        const resText = String(output.output ?? "").slice(0, 6000);
+        const resText = String(output.output ?? "").slice(0, MAX_DIFF_CHARS);
         if (/error|failed|exception|panic/i.test(resText)) {
-          emit("tool.completed", "bash", files, resText, `${intent} [输出含错误]`, true, flags.hasApiCall, false, 0);
+          emit(
+            "tool.completed",
+            "bash",
+            files,
+            resText,
+            `${intent} [输出含错误]`,
+            true,
+            flags.hasApiCall,
+            false,
+            0,
+          );
         }
       }
     },

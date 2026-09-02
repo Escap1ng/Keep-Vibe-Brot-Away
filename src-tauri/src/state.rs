@@ -17,7 +17,7 @@
 //!    └─ facts.json        项目全局记忆(≤50KB)
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -53,31 +53,26 @@ pub fn project_key(project_path: &str) -> String {
     out[..16].to_string()
 }
 
+/// 对话窗口条数(仅用于「下一轮优化提示词」的上下文,零 LLM 成本)
+pub const DIALOG_WINDOW: usize = 3;
+/// 单条对话原始 JSON 的字符上限
+pub const DIALOG_MAX_CHARS: usize = 3000;
+
 /// 单项目活数据:滚动事件窗口 + 记忆 + 对话窗口
+#[derive(Default)]
 pub struct ProjectLive {
-    /// 最近 200 条事件(内存镜像,与 events.log 同步)
+    /// 最近 ROLLING_LIMIT 条事件(内存镜像,与 events.log 同步)
     pub events: VecDeque<NormalizedEvent>,
     /// 项目全局记忆(None = 尚未生成)
     pub facts: Option<Facts>,
-    /// 对话记忆:最近 3 条事件原始 JSON 截断副本(每条 ≤3KB),零 LLM 成本
+    /// 对话记忆:最近 DIALOG_WINDOW 条事件原始 JSON 截断副本(每条 ≤3KB)
     pub dialog: VecDeque<String>,
     /// 自上次增量精炼以来被消费的问题数(≥20 触发合并)
     pub consumed_since_merge: u32,
 }
 
-impl ProjectLive {
-    pub fn new() -> Self {
-        Self {
-            events: VecDeque::new(),
-            facts: None,
-            dialog: VecDeque::new(),
-            consumed_since_merge: 0,
-        }
-    }
-}
-
 /// 本地 HTTP 端点信息(写入 endpoint.json 供适配器读取)
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointInfo {
     pub port: u16,
@@ -151,8 +146,6 @@ pub struct Core {
     /// 被暂停(设置) / 胶囊隐藏标记
     pub paused: bool,
     pub capsule_hidden: bool,
-    /// 胶囊前端状态机(idle/active/popup)——仅记录
-    pub capsule_state: String,
 }
 
 /// 运行统计(§1.5 成功度量的本地埋点):当日计数 + 历史累计,持久化到 stats.json
@@ -215,16 +208,11 @@ impl Core {
             last_event_in: None,
             paused: false,
             capsule_hidden: false,
-            capsule_state: "idle".into(),
         }
     }
 
     pub fn project_live(&mut self, path: &str) -> &mut ProjectLive {
-        let key = project_key(path);
-        self.projects.entry(key.clone()).or_insert_with(|| {
-            let live = ProjectLive::new();
-            live
-        })
+        self.projects.entry(project_key(path)).or_default()
     }
 }
 
@@ -233,6 +221,8 @@ pub struct AppState {
     pub core: CoreLock,
     pub data_dir: PathBuf,
     pub app: tauri::AppHandle,
+    /// 本次进程的真实端点:HTTP 服务绑定成功后写一次,此前为空
+    pub endpoint: std::sync::OnceLock<EndpointInfo>,
 }
 
 impl AppState {
@@ -240,21 +230,23 @@ impl AppState {
         let data_dir = app.path().app_data_dir()?;
         std::fs::create_dir_all(&data_dir)?;
 
-        let settings = crate::settings::load_settings(&data_dir)?;
-
         let state = Arc::new(Self {
-            core: CoreLock::from(Core::empty(settings)),
+            // 设置与各持久化文件统一由 load_persisted 载入,此处只建空壳
+            core: CoreLock::from(Core::empty(Settings::default())),
             data_dir,
             app: app.clone(),
+            endpoint: std::sync::OnceLock::new(),
         });
 
-        crate::state::load_persisted(&state)?;
+        load_persisted(&state)?;
         Ok(state)
     }
 
     /// 项目数据子目录
     pub fn project_dir(&self, project_path: &str) -> PathBuf {
-        self.data_dir.join("projects").join(project_key(project_path))
+        self.data_dir
+            .join("projects")
+            .join(project_key(project_path))
     }
 
     pub fn ensure_project_dir(&self, project_path: &str) -> PathBuf {
@@ -283,7 +275,7 @@ pub struct PipelineSnapshot {
     pub last_event_id: String,
 }
 
-/// 持久化载入:settings/queue/cooldown/budget/facts(项目按需)
+/// 持久化载入:settings/queue/cooldown/budget/stats/facts(项目按需)
 pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
     let dir = &state.data_dir;
     let mut core = state.core.blocking_lock();
@@ -291,9 +283,9 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
     core.settings = crate::settings::load_settings(dir)?;
     core.paused = core.settings.paused;
 
-    // 队列与历史:queue.json 混存过队列+历史(旧版),这里按状态分流 + 按 id 去重
+    // 队列与历史:旧版把两者混存于 queue.json,这里按状态分流 + 按 id 去重
     {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         if let Ok(raw) = std::fs::read_to_string(dir.join("history.json")) {
             if let Ok(cards) = serde_json::from_str::<Vec<Card>>(&raw) {
                 for c in cards {
@@ -309,7 +301,7 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
                     if !seen.insert(c.id.clone()) {
                         continue;
                     }
-                    if c.status == "pending" && now_ts() - c.created_at <= 2 * 3600 {
+                    if c.status == "pending" && now_ts() - c.created_at <= crate::queue::TTL_SECS {
                         core.queue.push_back(c);
                     } else if c.status != "pending" {
                         // 兼容旧版混存:非 pending 归档进历史
@@ -344,18 +336,21 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
-    // 攒批缓冲(丢弃超过 24h 的陈旧项)
+    // 攒批缓冲(丢弃超过保鲜期的陈旧项)
     if let Ok(raw) = std::fs::read_to_string(dir.join("batch.json")) {
         if let Ok(list) = serde_json::from_str::<Vec<BatchItem>>(&raw) {
             let now = now_ts();
-            core.pending_batch = list.into_iter().filter(|b| now - b.created_at < 24 * 3600).collect();
+            core.pending_batch = list
+                .into_iter()
+                .filter(|b| now - b.created_at < crate::llm::budget::BATCH_TTL_SECS)
+                .collect();
         }
     }
 
-    // 决策日志(滚动 200,取最近 200 行)
+    // 决策日志(滚动 DECISION_LOG_KEEP,取最近若干行)
     if let Ok(raw) = std::fs::read_to_string(dir.join("decision-log.jsonl")) {
         let lines: Vec<&str> = raw.lines().collect();
-        let start = lines.len().saturating_sub(200);
+        let start = lines.len().saturating_sub(crate::gate::DECISION_LOG_KEEP);
         for line in &lines[start..] {
             if let Ok(e) = serde_json::from_str::<crate::gate::DecisionEntry>(line) {
                 core.decision_log.push_back(e);
@@ -370,9 +365,11 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
         let mut newest: Option<(i64, String)> = None;
         for entry in entries.flatten() {
             let log = entry.path().join("events.log");
-            let Ok(raw) = std::fs::read_to_string(&log) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&log) else {
+                continue;
+            };
             let mut events: Vec<NormalizedEvent> = Vec::new();
-            for line in raw.lines().rev().take(200) {
+            for line in raw.lines().rev().take(crate::events::ROLLING_LIMIT) {
                 if let Ok(ev) = serde_json::from_str::<NormalizedEvent>(line) {
                     events.push(ev);
                 }
@@ -383,10 +380,11 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
             }
             let path = events.last().unwrap().project_path.clone();
             let key = project_key(&path);
-            let mut live = ProjectLive::new();
-            for ev in events.iter().rev().take(3) {
+            let mut live = ProjectLive::default();
+            for ev in events.iter().rev().take(DIALOG_WINDOW) {
                 let r = serde_json::to_string(ev).unwrap_or_default();
-                live.dialog.push_back(r.chars().take(3000).collect());
+                live.dialog
+                    .push_back(r.chars().take(DIALOG_MAX_CHARS).collect());
             }
             live.events = events.into_iter().collect();
             if let Some(facts) = crate::memory::load_facts(&entry.path()) {
@@ -447,45 +445,66 @@ pub fn save_core_locked(dir: &std::path::Path, core: &Core) {
     let _ = std::fs::write(dir.join("decision-log.jsonl"), text);
 }
 
-/// history_list:历史卡片列表 command 实现见 state 模块聚合
-pub fn history_list_inner(state: &Arc<AppState>) -> Vec<Card> {
+/// 历史卡片列表(设置面板「历史」Tab)
+#[tauri::command]
+pub fn history_list(state: tauri::State<'_, Arc<AppState>>) -> Vec<Card> {
     state.core.blocking_lock().history.clone()
 }
 
-/// facts_get 返回值由 frontend 展示
-#[tauri::command]
-pub fn history_list(state: tauri::State<'_, Arc<AppState>>) -> Vec<Card> {
-    history_list_inner(&state)
-}
-
+/// 本地端点信息(设置面板诊断)。
+/// 只信内存里本次进程的真实值:磁盘上的 endpoint.json 可能属于上一次进程,
+/// 拿它兜底会显示一个早已失效的端口,反而把"适配器连不通"误导成"端点正常"。
 #[tauri::command]
 pub fn endpoint_info(state: tauri::State<'_, Arc<AppState>>) -> EndpointInfo {
-    let path = state.data_dir.join("endpoint.json");
-    let _ = path;
-    let info = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|x| serde_json::from_str::<EndpointInfo>(&x).ok());
-    info.unwrap_or(EndpointInfo {
-        port: 0,
-        hello_token: String::new(),
-        event_token: String::new(),
-    })
+    state.endpoint.get().cloned().unwrap_or_default()
 }
 
+/// 活动项目的记忆(设置面板展示)
 #[tauri::command]
-pub fn facts_get(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json::Value> {
+pub fn facts_get(state: tauri::State<'_, Arc<AppState>>) -> Option<Facts> {
     let core = state.core.blocking_lock();
-    if let Some(key) = &core.active_project {
-        if let Some(live) = core.projects.get(key) {
-            return live.facts.as_ref().map(|f| serde_json::to_value(f).ok()).flatten();
-        }
+    core.active_project
+        .as_ref()
+        .and_then(|key| core.projects.get(key))
+        .and_then(|live| live.facts.clone())
+}
+
+/// 累计口径的成功度量(设置面板「累计」行)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsTotals {
+    pub cards_created: u64,
+    pub answers: u64,
+    pub unsatisfied: u64,
+    pub answer_rate: f64,
+}
+
+/// `stats_info` 的响应契约(与前端 lib/types.ts 的 StatsInfo 一一对应)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsInfo {
+    pub last_event_in: Option<i64>,
+    pub active_project: String,
+    pub cards_created: u64,
+    pub answers: u64,
+    pub unsatisfied: u64,
+    pub today_answer_rate: f64,
+    pub total: StatsTotals,
+    pub batched: usize,
+}
+
+/// 回答率(0–100,分母为 0 时记 0)
+fn answer_rate(answers: u64, cards: u64) -> f64 {
+    if cards == 0 {
+        0.0
+    } else {
+        answers as f64 * 100.0 / cards as f64
     }
-    None
 }
 
 /// 运行统计(设置面板诊断:适配器是否在打通 + §1.5 成功度量本地埋点)
 #[tauri::command]
-pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
+pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
     let mut core = state.core.blocking_lock();
     // 读取时顺带跨日归并(避免隔夜仍显示昨日"当日"计数)
     let rolled = core.stats.date != local_date();
@@ -496,24 +515,30 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
             serde_json::to_string(&core.stats).unwrap_or_default(),
         );
     }
-    let rate = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
-    serde_json::json!({
-        "lastEventIn": core.last_event_in,
-        "activeProject": core.active_project.as_ref().map(|k| {
-            core.projects.get(k).and_then(|p| p.events.back().map(|e| e.project_path.clone()))
-        }).flatten().unwrap_or_default(),
-        "cardsCreated": core.stats.cards_created,
-        "answers": core.stats.answers,
-        "unsatisfied": core.stats.unsatisfied,
-        "todayAnswerRate": rate(core.stats.answers, core.stats.cards_created),
-        "total": {
-            "cardsCreated": core.stats.total_cards_created,
-            "answers": core.stats.total_answers,
-            "unsatisfied": core.stats.total_unsatisfied,
-            "answerRate": rate(core.stats.total_answers, core.stats.total_cards_created),
+    // 活动项目路径:取该项目窗口内最近事件的原始路径(内存中不单独存,故回查事件)
+    let active_project = core
+        .active_project
+        .as_ref()
+        .and_then(|key| core.projects.get(key))
+        .and_then(|live| live.events.back())
+        .map(|e| e.project_path.clone())
+        .unwrap_or_default();
+    let s = &core.stats;
+    StatsInfo {
+        last_event_in: core.last_event_in,
+        active_project,
+        cards_created: s.cards_created,
+        answers: s.answers,
+        unsatisfied: s.unsatisfied,
+        today_answer_rate: answer_rate(s.answers, s.cards_created),
+        total: StatsTotals {
+            cards_created: s.total_cards_created,
+            answers: s.total_answers,
+            unsatisfied: s.total_unsatisfied,
+            answer_rate: answer_rate(s.total_answers, s.total_cards_created),
         },
-        "batched": core.pending_batch.len(),
-    })
+        batched: core.pending_batch.len(),
+    }
 }
 
 #[cfg(test)]

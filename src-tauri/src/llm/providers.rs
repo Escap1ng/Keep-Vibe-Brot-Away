@@ -58,8 +58,11 @@ async fn stream_openai(
         "stream": true,
         "max_tokens": req.max_output_tokens,
     });
-    // DeepSeek 等部分实现要求 max_tokens 必须 ≥1;若模型不支持可走兼容参数
-    let _ = &mut body;
+    // DeepSeek V4 默认开启思考模式:输出预算会先被 reasoning_content 吃掉,而本解析器
+    // 只读 delta.content → 聚合为空 → 判定「LLM 分析失败」。对 DeepSeek 端点显式禁用思考。
+    if base.to_lowercase().contains("deepseek") {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
 
     let resp = client
         .post(&url)
@@ -222,9 +225,7 @@ fn sse_lines(resp: reqwest::Response) -> impl Stream<Item = anyhow::Result<Strin
                             continue;
                         }
                     }
-                    Err(e) => {
-                        return Some((Err(anyhow::anyhow!("流解码失败:{e}")), (bytes, buf)))
-                    }
+                    Err(e) => return Some((Err(anyhow::anyhow!("流解码失败:{e}")), (bytes, buf))),
                 }
             }
             let tail = buf.trim().to_string();

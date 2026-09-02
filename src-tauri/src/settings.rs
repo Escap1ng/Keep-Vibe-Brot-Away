@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri_plugin_autostart::ManagerExt;
 
-use crate::state::now_ts;
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -54,27 +52,35 @@ pub fn settings_path(dir: &std::path::Path) -> PathBuf {
     dir.join(SETTINGS_FILE)
 }
 
+/// 读取设置;文件缺失或损坏一律回退默认值(不阻塞启动)。
+/// `capsuleHidden` 是运行期状态,不落盘生效——每次启动强制显示胶囊。
 pub fn load_settings(dir: &std::path::Path) -> anyhow::Result<Settings> {
-    match std::fs::read_to_string(settings_path(dir)) {
-        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
-            Ok(mut s) => {
-                // 每次启动记录
-                if s.capsule_hidden {
-                    // 保持用户上次的隐藏状态
-                }
-                s.capsule_hidden = false; // 默认启动显示胶囊
-                Ok(s)
-            }
-            Err(_) => Ok(Settings::default()),
-        },
-        Err(_) => Ok(Settings::default()),
-    }
+    let raw = std::fs::read_to_string(settings_path(dir)).unwrap_or_default();
+    let mut s = serde_json::from_str::<Settings>(&raw).unwrap_or_default();
+    s.capsule_hidden = false;
+    Ok(s)
 }
 
 pub fn save_settings(dir: &std::path::Path, s: &Settings) -> anyhow::Result<()> {
     let raw = serde_json::to_string_pretty(s)?;
     std::fs::write(settings_path(dir), raw)?;
     Ok(())
+}
+
+/// 前端可补丁的字段:全部可选,字段缺失即"保持原值"。
+/// 因此不能直接反序列化成 `Settings`——那会把未提交的字段重置为默认值。
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct SettingsPatch {
+    provider: Option<String>,
+    model: Option<String>,
+    /// 双层 Option:字段缺失 = 保留原值,显式 null = 清空为「官方端点」
+    base_url: Option<Option<String>>,
+    daily_budget: Option<u64>,
+    autostart: Option<bool>,
+    p0_replace_queue: Option<bool>,
+    paused: Option<bool>,
+    capsule_hidden: Option<bool>,
 }
 
 #[tauri::command]
@@ -90,43 +96,52 @@ pub fn settings_put(
     let state = state.inner().clone();
     let dir = state.data_dir.clone();
     let mut core = state.core.blocking_lock();
-    let old = core.settings.clone();
-    let mut next = old.clone();
-    if let Ok(current) = serde_json::from_value::<Settings>(patch.clone()) {
-        // 只允许更新白名单字段,保留内部字段
-        next.provider = current.provider;
-        next.model = current.model;
-        next.base_url = current.base_url;
-        next.daily_budget = current.daily_budget;
-        next.autostart = current.autostart;
-        next.p0_replace_queue = current.p0_replace_queue;
-    }
-    // 单独的字段式补丁(前端的部分更新)
-    if let Some(v) = patch.get("paused") {
-        if let Some(b) = v.as_bool() {
-            next.paused = b;
+    // 只接受白名单内的补丁字段;整体覆盖会把未提交的字段重置为默认值
+    let p = serde_json::from_value::<SettingsPatch>(patch)
+        .map_err(|e| format!("无效的设置补丁:{e}"))?;
+    {
+        let s = &mut core.settings;
+        if let Some(v) = p.provider {
+            s.provider = v;
+        }
+        if let Some(v) = p.model {
+            s.model = v;
+        }
+        if let Some(v) = p.base_url {
+            s.base_url = v;
+        }
+        if let Some(v) = p.daily_budget {
+            s.daily_budget = v.max(1);
+        }
+        if let Some(v) = p.autostart {
+            s.autostart = v;
+        }
+        if let Some(v) = p.p0_replace_queue {
+            s.p0_replace_queue = v;
+        }
+        if let Some(v) = p.paused {
+            s.paused = v;
+        }
+        if let Some(v) = p.capsule_hidden {
+            s.capsule_hidden = v;
         }
     }
-    if let Some(v) = patch.get("capsuleHidden") {
-        if let Some(b) = v.as_bool() {
-            next.capsule_hidden = b;
-        }
-    }
-
-    core.settings = next;
+    // 运行期镜像:Core 上的标志位始终跟随设置
     core.paused = core.settings.paused;
     core.capsule_hidden = core.settings.capsule_hidden;
 
-    // 应用自启动设置
-    let autostart_target = core.settings.autostart;
-    let app = state.app.clone();
-    let _ = app.autolaunch().enable();
-    if !autostart_target {
-        let _ = app.autolaunch().disable();
-    }
+    apply_autostart(state.app.clone(), core.settings.autostart);
 
     let _ = save_settings(&dir, &core.settings);
-    drop(core);
-    let _ = now_ts();
     Ok(())
+}
+
+/// 自启开关(插件提供 enable/disable 两个动作,按目标状态单向调用以免误注册)
+fn apply_autostart(app: tauri::AppHandle, enable: bool) {
+    let autolaunch = app.autolaunch();
+    let _ = if enable {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
 }

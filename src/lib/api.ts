@@ -7,6 +7,7 @@ import type {
   EndpointInfo,
   Facts,
   Settings,
+  StatsInfo,
 } from "./types";
 
 export const api = {
@@ -24,22 +25,7 @@ export const api = {
   endpointInfo: () => invoke<EndpointInfo>("endpoint_info"),
   budgetInfo: () => invoke<BudgetInfo>("budget_info"),
   llmTest: () => invoke<string>("llm_test_connection"),
-  statsInfo: () =>
-    invoke<{
-      lastEventIn: number | null;
-      activeProject: string;
-      cardsCreated: number;
-      answers: number;
-      unsatisfied: number;
-      todayAnswerRate: number;
-      total: {
-        cardsCreated: number;
-        answers: number;
-        unsatisfied: number;
-        answerRate: number;
-      };
-      batched: number;
-    }>("stats_info"),
+  statsInfo: () => invoke<StatsInfo>("stats_info"),
   secretsPut: (provider: string, key: string) =>
     invoke<void>("secrets_put", { provider, key }),
   secretsTest: () => invoke<string[]>("secrets_test"),
@@ -49,6 +35,5 @@ export const api = {
   capsuleHide: () => invoke<void>("capsule_hide"),
   capsuleShow: () => invoke<void>("capsule_show"),
   settingsOpen: () => invoke<void>("settings_open"),
-  capsuleSetState: (capsuleState: string) =>
-    invoke<void>("capsule_set_state", { capsuleState }),
+  quitApp: () => invoke<void>("quit_app"),
 };

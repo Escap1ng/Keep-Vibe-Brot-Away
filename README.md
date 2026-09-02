@@ -5,8 +5,8 @@
 KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相关的知识点、审查质疑、知情度提问"递"给用户。它不是一个弹窗广告,而是一个**被用户消费的节奏**——问题队列最多 3 张,用户不消费,它就沉默。
 
 ```text
-CodingAgent(opencode / Claude Code)
-  → 适配器(opencode 插件 / claude-code bridge / jsonl watcher)
+CodingAgent(opencode / Claude Code / Trae)
+  → 适配器(opencode 插件 / claude-code bridge / jsonl watcher / Trae hook)
   → POST /kvba/events(127.0.0.1 随机端口 + token 鉴权)
   → KVBA(Rust 核心:门控决策树 0 token / 记忆层 / 队列 / 加密存储 / LLM 客户端)
   → 悬浮胶囊:递知识 + 抛问题,不满意自动生成「下一轮优化提示词」回写 Agent
@@ -58,7 +58,7 @@ npm run tauri build   # 产物: src-tauri/target/release/bundle/nsis/*.exe
 
 ### 与 opencode 联动
 
-插件文件:前板 `adapters/opencode-plugin/kvba-plugin.ts`(或本仓库 `.opencode/plugins/kvba-plugin.ts` 即开即用)。
+插件文件:正本 `adapters/opencode-plugin/kvba-plugin.ts`(副本 `.opencode/plugins/kvba-plugin.ts` 即开即用,两者必须一致)。
 
 ```bash
 # 全局安装(所有项目)
@@ -108,9 +108,23 @@ cargo build --release
 Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
 ```
 
+### 与 Trae 联动
+
+零编译,装好 Node 即可:
+
+```powershell
+md .trae
+copy adapters\trae-hook\hooks.sample.json .trae\hooks.json
+# 然后编辑 .trae\hooks.json,把 <替换为本仓库的绝对路径> 改成实际路径
+```
+
+`.trae/hooks.json` 是机器相关的本地配置(含绝对路径),已在 `.gitignore` 内,不会随仓库分发。脚本在 `PostToolUse` 读 `tool_name/tool_input/tool_response`、在 `Stop` 发 `turn.ended`,并把 Trae 的工具名映射成门控期望的规范小写名(`SearchReplace→edit`、`RunCommand→bash`、`Read→read` …);`RunCommand` 不算写事件,避免把跑命令误判成改代码。
+
+排查时设 `$env:KVBA_HOOK_DEBUG = "1"`,每次 hook 触发会往 stderr 打一行投递结果。
+
 ### 端点发现
 
-三处适配器统一从 `<数据目录>\endpoint.json` 读取端口与 token(`KVBA_DATA_DIR` 环境变量可覆盖数据目录;Windows 默认为 `%APPDATA%\dev.kvba.app`)。`/kvba/hello` 用主 token 换取事件上报 token,每次重启都会让主进程再次随机化端口与 token。
+各适配器统一从 `<数据目录>\endpoint.json` 读取端口与 token(`KVBA_DATA_DIR` 环境变量可覆盖数据目录;Windows 默认为 `%APPDATA%\dev.kvba.app`)。`/kvba/hello` 用主 token 换取事件上报 token,每次重启都会让主进程再次随机化端口与 token。
 
 ---
 
@@ -130,8 +144,9 @@ Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
 ```text
 ┌────────────────────────────────────────────────────────────┐
 │ CodingAgent 环境                                            │
-│  Claude Code: hooks PostToolUse/Stop + JSONL watcher 兜底   │
-│  opencode: TS 插件(事件钩子)                               │
+│  Claude Code: hooks PostToolUse/Stop + JSONL watcher 兜底    │
+│  opencode:    TS 插件(事件钩子)                            │
+│  Trae:        hooks PostToolUse/Stop -> node 脚本            │
 │  输出统一"归一化事件"→ POST http://127.0.0.1:<port>/kvba/events
 └──────────────────────────┬─────────────────────────────────┘
                            │ HTTP(握手 token 鉴权,仅 127.0.0.1)
@@ -166,10 +181,11 @@ Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
 
 ```text
 src-tauri/            Rust 核心(gate/events/memory/llm/crypto/queue/http + window/tray)
-src/                  Vue3 + Vite 前端(胶囊状态机、面板、设置/历史/决策日志)
+src/                  Vue3 + Vite 前端(胶囊圆点、面板、设置/历史/决策日志)
 adapters/
   claude-code/        Rust 桥:kvba-claude-bridge(stdin hook)+kvba-claude-watcher(jsonl)
   opencode-plugin/    TS 插件(kvba-plugin.ts)
+  trae-hook/          Node 脚本适配器(kvba-trae-hook.mjs + hooks.sample.json)
 docs/                 规格与文档
 ```
 
@@ -178,7 +194,7 @@ docs/                 规格与文档
 - **CI**(`.github/workflows/ci.yml`,每次 push / PR / 三平台矩阵):
   `vue-tsc + vite build` → opencode 插件 `tsc --noEmit`(并校验 `.opencode/plugins/` 副本与源文件一致)→
   `cargo test --locked`(主程序 + claude-code 适配器)。
-  `cargo fmt --check` 与 `cargo clippy` 现阶段**只写进任务摘要、不阻断合并**;存量 clippy 警告清零后可改为 `-D warnings` 门禁。
+  `cargo fmt --check` 与 `cargo clippy -- -D warnings` 均为**阻断门禁**(两个 Rust 工程当前零告警)。
 - **发布**(`.github/workflows/release.yml`):打 tag 即三平台打包并把产物挂到 GitHub Release。
 
   ```bash

@@ -1,6 +1,11 @@
 // KVBA 前端共享类型(与 Rust 侧 serde camelCase 对齐)
 
-export type CapsuleView = "idle" | "active" | "popup";
+/** 待答队列上限(与 Rust queue::MAX_PENDING 一致) */
+export const MAX_PENDING = 3;
+/** 优化提示词生成中的占位(与 Rust queue::PROMPT_PENDING_MARK 一致) */
+export const PROMPT_PENDING_MARK = "(生成中)";
+/** 每日 LLM 调用上限默认值(与 Rust Settings::default 一致) */
+export const DEFAULT_DAILY_BUDGET = 80;
 
 export interface Card {
   id: string;
@@ -62,4 +67,21 @@ export interface EndpointInfo {
   port: number;
   helloToken: string;
   eventToken: string;
+}
+
+/** 运行统计(§1.5 成功度量本地埋点):当日计数 + 历史累计 */
+export interface StatsInfo {
+  lastEventIn: number | null;
+  activeProject: string;
+  cardsCreated: number;
+  answers: number;
+  unsatisfied: number;
+  todayAnswerRate: number;
+  total: {
+    cardsCreated: number;
+    answers: number;
+    unsatisfied: number;
+    answerRate: number;
+  };
+  batched: number;
 }

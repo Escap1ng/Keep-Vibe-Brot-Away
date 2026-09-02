@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::state::DIALOG_WINDOW;
+
 pub const SCHEMA: &str = "kvba.event.v1";
 
 pub const MAX_DIFF_CHARS: usize = 6000;
@@ -97,91 +99,69 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// 事件存储:内存镜像 + JSONL 滚动落盘
+/// 事件存储:内存窗口 + JSONL 滚动落盘(无实例状态,全部为关联函数)
 pub struct EventStore;
 
 impl EventStore {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// 摄入事件:入内存窗口 + 重写滚动日志(异步封装由调用方处理)
+    /// 摄入事件:清洗 → 入内存窗口 → 滚动落盘。返回落库所用的清洗后事件。
     pub fn ingest(
-        &self,
         state: &std::sync::Arc<crate::state::AppState>,
         ev: NormalizedEvent,
     ) -> anyhow::Result<NormalizedEvent> {
-        let ev = ev.sanitize().map_err(|e| anyhow::anyhow!(e))?;
-        let state = state.clone();
+        let ev = ev.sanitize().map_err(anyhow::Error::msg)?;
         let dir = state.ensure_project_dir(&ev.project_path);
 
         let key = crate::state::project_key(&ev.project_path);
-        let mut core = state.core.blocking_lock();
-        core.active_project = Some(key.clone());
-        core.last_event_in = Some(crate::state::now_ts());
-        if !core.projects.contains_key(&key) {
-            core.projects.insert(key.clone(), crate::state::ProjectLive::new());
-        }
         {
-            let live = core.projects.get_mut(&key).expect("已插入");
+            let mut core = state.core.blocking_lock();
+            core.active_project = Some(key.clone());
+            core.last_event_in = Some(crate::state::now_ts());
+            let live = core.projects.entry(key).or_default();
 
-            // 对话窗口:最近 3 条原始 JSON 截断副本(≤3KB),纯滚动替换(零 LLM 成本)
-            let raw = serde_json::to_string(&ev).unwrap_or_default();
-            let raw: String = raw.chars().take(3000).collect();
+            // 对话窗口:最近 DIALOG_WINDOW 条原始 JSON 截断副本,纯滚动替换(零 LLM 成本)
+            let raw: String = serde_json::to_string(&ev)
+                .unwrap_or_default()
+                .chars()
+                .take(crate::state::DIALOG_MAX_CHARS)
+                .collect();
             live.dialog.push_back(raw);
-            while live.dialog.len() > 3 {
+            while live.dialog.len() > DIALOG_WINDOW {
                 live.dialog.pop_front();
             }
 
-            // 事件窗口(200 条)
+            // 事件窗口(ROLLING_LIMIT 条)
             live.events.push_back(ev.clone());
             while live.events.len() > ROLLING_LIMIT {
                 live.events.pop_front();
             }
         }
-        drop(core);
 
-        // 滚动落盘(仅最近 200 条;写入失败不影响内存)
-        let _ = self.persist_rolling(&dir, &ev.project_path, state.clone());
+        // 落盘失败不影响内存窗口(下次摄入会整体重写)
+        let _ = Self::persist_rolling(&dir, &ev.project_path, state);
         Ok(ev)
     }
 
-    /// 重写 events.log(JSONL,200 条)
+    /// 整体重写 events.log(JSONL,最多 ROLLING_LIMIT 条)
     fn persist_rolling(
-        &self,
         dir: &std::path::Path,
         project_path: &str,
-        state: std::sync::Arc<crate::state::AppState>,
+        state: &std::sync::Arc<crate::state::AppState>,
     ) -> anyhow::Result<()> {
         let key = crate::state::project_key(project_path);
-        let core = state.core.blocking_lock();
-        let events: Vec<_> = core
-            .projects
-            .get(&key)
-            .map(|p| p.events.iter().cloned().collect())
-            .unwrap_or_default();
-        drop(core);
-        let mut text = String::new();
-        for e in events {
-            if let Ok(line) = serde_json::to_string(&e) {
-                text.push_str(&line);
-                text.push('\n');
+        let text = {
+            let core = state.core.blocking_lock();
+            let mut text = String::new();
+            if let Some(live) = core.projects.get(&key) {
+                for e in live.events.iter() {
+                    if let Ok(line) = serde_json::to_string(e) {
+                        text.push_str(&line);
+                        text.push('\n');
+                    }
+                }
             }
-        }
+            text
+        };
         std::fs::write(dir.join("events.log"), text)?;
         Ok(())
-    }
-
-    /// 取项目最近事件(供 gate 与记忆用)
-    pub fn recent_events(
-        state: &std::sync::Arc<crate::state::AppState>,
-        project_path: &str,
-    ) -> Vec<NormalizedEvent> {
-        let key = crate::state::project_key(project_path);
-        let core = state.core.blocking_lock();
-        core.projects
-            .get(&key)
-            .map(|p| p.events.iter().cloned().collect())
-            .unwrap_or_default()
     }
 }

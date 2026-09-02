@@ -1,12 +1,19 @@
+# 构建产物
 node_modules
 dist
 target
 *.log
+
+# 本地状态与工具链
 .kvba
+.trae
 
 # 本地 agent 工具链(非产品代码)
 .opencode/skills/
 .opencode/node_modules/
+
+# Tauri 生成物(每次 build/dev 自动重建)
+src-tauri/gen/
 
 # 移动端图标(本期仅桌面)
 src-tauri/icons/android/

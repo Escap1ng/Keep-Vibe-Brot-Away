@@ -37,6 +37,11 @@ jobs:
       - name: opencode 插件副本必须与源文件一致
         run: cmp adapters/opencode-plugin/kvba-plugin.ts .opencode/plugins/kvba-plugin.ts
 
+      - name: Trae hook 语法与配置模板校验
+        run: |
+          node --check adapters/trae-hook/kvba-trae-hook.mjs
+          node -e "JSON.parse(require('fs').readFileSync('adapters/trae-hook/hooks.sample.json','utf8'))"
+
       - name: 类型检查与构建
         run: npm run build
 
@@ -91,55 +96,27 @@ jobs:
             src-tauri
             adapters/claude-code
 
-      - name: cargo fmt --check (仅提示)
+      - name: cargo fmt --check
         working-directory: src-tauri
         run: cargo fmt --all --check
-        continue-on-error: true
 
-      - name: clippy — 主程序 (仅报告)
+      - name: clippy — 主程序
         working-directory: src-tauri
-        shell: bash
-        run: |
-          cargo clippy --all-targets --locked --message-format=short 2>&1 \
-            | tee "$RUNNER_TEMP/clippy-core.txt"
-          exit 0
-        continue-on-error: true
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: 单元测试 — 主程序
         working-directory: src-tauri
         run: cargo test --locked
 
-      - name: clippy — claude-code 适配器 (仅报告)
+      - name: cargo fmt --check — claude-code 适配器
         working-directory: adapters/claude-code
-        shell: bash
-        run: |
-          cargo clippy --all-targets --locked --message-format=short 2>&1 \
-            | tee "$RUNNER_TEMP/clippy-adapter.txt"
-          exit 0
-        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: clippy — claude-code 适配器
+        working-directory: adapters/claude-code
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: 单元测试 — claude-code 适配器
         working-directory: adapters/claude-code
         run: cargo test --locked
 
-      - name: Lint 汇总 (写入任务摘要)
-        if: always()
-        shell: bash
-        run: |
-          count() {
-            local f="$1"
-            [ -f "$f" ] || { echo 0; return; }
-            awk '/warning:/ && !/generated/' "$f" | wc -l | tr -d ' '
-          }
-          core=$(count "$RUNNER_TEMP/clippy-core.txt") || core=0
-          adapter=$(count "$RUNNER_TEMP/clippy-adapter.txt") || adapter=0
-          {
-            echo "## clippy 报告 (${{ matrix.os }})"
-            echo ""
-            echo "| 目标 | 警告数 |"
-            echo "|---|---|"
-            echo "| src-tauri | ${core:-0} |"
-            echo "| adapters/claude-code | ${adapter:-0} |"
-            echo ""
-            echo "> 当前为基线报告,不阻断合并;清零后可改为 \`-D warnings\` 门禁。"
-          } >> "$GITHUB_STEP_SUMMARY"

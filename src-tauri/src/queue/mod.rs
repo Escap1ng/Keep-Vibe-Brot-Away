@@ -4,7 +4,6 @@
 //! 排泄口:① 回答 ② 手动跳过 ③ 不再问这类(写入冷却矩阵) ④ TTL 2 小时 ⑤ 引用文件又被修改 → stale。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +15,14 @@ use crate::state::{now_ts, AppState};
 pub const MAX_PENDING: usize = 3;
 pub const TTL_SECS: i64 = 2 * 3600;
 pub const PENDING_OPTIONS: &[&str] = &["满意", "不满意", "自定义…"];
+/// 历史卡片归档上限(超出丢最旧)
+pub const HISTORY_MAX: usize = 500;
+/// 每消费这么多张卡,触发一次 facts 增量精炼
+pub const FACTS_MERGE_EVERY: u32 = 20;
+/// 优化提示词生成中的占位(前端据此不显示空提示词)
+pub const PROMPT_PENDING_MARK: &str = "(生成中)";
+/// 判定"不满意"的作答前缀
+pub const UNSATISFIED_MARK: &str = "不满意";
 
 /// 卡片 Schema(与规格书 5.2 一致)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +113,14 @@ impl CooldownMap {
 }
 
 /// 从 GatePass 生成卡片
-pub fn build_card(pass: &GatePass, text: String, ref_files: Vec<String>, ref_event_id: String, project_path: String, severity: &str) -> Card {
+pub fn build_card(
+    pass: &GatePass,
+    text: String,
+    ref_files: Vec<String>,
+    ref_event_id: String,
+    project_path: String,
+    severity: &str,
+) -> Card {
     Card {
         id: uuid::Uuid::new_v4().to_string(),
         kind: match pass.branch {
@@ -138,22 +152,23 @@ pub fn build_card(pass: &GatePass, text: String, ref_files: Vec<String>, ref_eve
 
 /// 卡片入队(队列满时:默认丢弃;P0 且设置允许 → 替换最旧一张)
 /// 含并发护栏:同指纹卡在 1h 内已存在(队列或历史)则拒绝入队,消除异步管线竞态重复
-pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str, &Card)) -> Option<Card> {
+pub fn insert_card(
+    core: &mut crate::state::Core,
+    card: Card,
+    emit: &dyn Fn(&str, &Card),
+) -> Option<Card> {
     // 竞态护栏:同指纹去重(与 G6 同规则,但加锁后复查)
-    let fp = crate::gate::fingerprint(
-        match card.kind.as_str() {
-            "review" => Branch::Review,
-            _ => Branch::Knowledge,
-        },
-        &card.theme,
-        card.ref_files.first().map(|s| s.as_str()).unwrap_or(""),
-    );
+    let fp = crate::gate::fingerprint_for_card(&card);
     let now = now_ts();
     let dup = core
         .queue
         .iter()
         .filter(|c| c.status == "pending")
-        .chain(core.history.iter().filter(|c| now - c.created_at < crate::gate::DEDUP_WINDOW_SECS))
+        .chain(
+            core.history
+                .iter()
+                .filter(|c| now - c.created_at < crate::gate::DEDUP_WINDOW_SECS),
+        )
         .any(|c| crate::gate::fingerprint_for_card(c) == fp);
     if dup {
         log::info!("竞态护栏:同指纹卡片已存在,丢弃重复卡(theme={})", card.theme);
@@ -163,13 +178,8 @@ pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str
     let pending_count = core.queue.iter().filter(|c| c.status == "pending").count();
     if pending_count >= MAX_PENDING {
         if card.severity == "P0" && core.settings.p0_replace_queue {
-            // 替换最旧的一张 pending
-            let oldest = core
-                .queue
-                .iter()
-                .find(|c| c.status == "pending")
-                .cloned();
-            if let Some(mut old_card) = oldest {
+            // 替换最旧的一张 pending(队列按创建顺序入队,队首即最旧)
+            if let Some(mut old_card) = core.queue.iter().find(|c| c.status == "pending").cloned() {
                 old_card.status = "dismissed".into();
                 emit("card.dismissed", &old_card);
                 // 被替换的卡同样归档进历史,避免只改状态留在队列、重启后静默丢失
@@ -181,8 +191,8 @@ pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str
     }
 
     // 主题冷却记录
-    core.cooldowns.touch_asked(&card.theme, now_ts());
-    core.last_card_at = Some(now_ts());
+    core.cooldowns.touch_asked(&card.theme, now);
+    core.last_card_at = Some(now);
     core.stats.roll_to_today();
     core.stats.cards_created += 1;
     core.queue.push_back(card.clone());
@@ -190,12 +200,12 @@ pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str
     Some(card)
 }
 
-/// 归档已退场的卡片:移出队列并计入历史(上限 500,丢最旧)
+/// 归档已退场的卡片:移出队列并计入历史(上限 HISTORY_MAX,丢最旧)
 pub fn archive_card(core: &mut crate::state::Core, card: Card) {
     core.queue.retain(|c| c.id != card.id);
     core.history.push(card);
-    if core.history.len() > 500 {
-        let overflow = core.history.len() - 500;
+    if core.history.len() > HISTORY_MAX {
+        let overflow = core.history.len() - HISTORY_MAX;
         core.history.drain(0..overflow);
     }
 }
@@ -214,7 +224,10 @@ pub fn persist_queue(core: &crate::state::Core, dir: &std::path::Path) -> anyhow
         .cloned()
         .collect();
     std::fs::write(dir.join("queue.json"), serde_json::to_string(&pending)?)?;
-    std::fs::write(dir.join("history.json"), serde_json::to_string(&core.history)?)?;
+    std::fs::write(
+        dir.join("history.json"),
+        serde_json::to_string(&core.history)?,
+    )?;
     Ok(())
 }
 
@@ -287,87 +300,79 @@ pub fn spawn_maintenance(handle: &tauri::AppHandle) {
     });
 }
 
-/// 队列推送:回答 / 跳过 / 不再问这类
+/// 队列推送:回答 / 跳过 / 不再问这类。返回卡片终态(供上层继续处理)。
+/// 冷却反馈、事实增量、归档与落盘都在此完成;锁只在同步段内持有。
 fn set_status_and_finish(
     state: &Arc<AppState>,
     card_id: &str,
     status: &str,
     answer: String,
     want_prompt: bool,
-) -> anyhow::Result<Option<Card>> {
+) -> anyhow::Result<Card> {
     let card = {
         let mut core = state.core.blocking_lock();
-        let found = core.queue.iter_mut().find(|c| c.id == card_id);
-        let Some(c) = found else {
-            return Err(anyhow::anyhow!("卡片不存在:{card_id}"));
-        };
+        let c = core
+            .queue
+            .iter_mut()
+            .find(|c| c.id == card_id)
+            .ok_or_else(|| anyhow::anyhow!("卡片不存在:{card_id}"))?;
         if c.status != "pending" {
             return Err(anyhow::anyhow!("卡片已处理:{}", c.status));
         }
         c.status = status.into();
         c.answer = answer.clone();
-        if want_prompt {
-            c.optimized_prompt = "(生成中)".into();
+        // 只有审查卡值得生成"下一轮优化提示词";上层据占位符判断是否触发异步生成
+        if want_prompt && c.kind == "review" {
+            c.optimized_prompt = PROMPT_PENDING_MARK.into();
         }
-        let clone = c.clone();
-        clone
+        c.clone()
     };
 
     let mut core = state.core.blocking_lock();
     core.stats.roll_to_today();
     core.stats.answers += 1;
-    if answer.contains("不满意") {
+    // 冷却矩阵反馈:连续不满意 → 自动静默 1h
+    let unsatisfied = answer.contains(UNSATISFIED_MARK);
+    if unsatisfied {
         core.stats.unsatisfied += 1;
     }
-    // 冷却矩阵反馈:连续不满意 → 自动静默 1h
-    let theme = card.theme.clone();
-    let unsatisfied = answer.contains("不满意");
     let now = now_ts();
-    core.cooldowns.note_answer(&theme, unsatisfied, now);
-    // 知情度回答 → 记入项目事实(用户回答过的知情度事实)
-    if card.kind == "awareness" && !answer.is_empty() {
-        let key = crate::state::project_key(&card.project_path);
-        if let Some(live) = core.projects.get_mut(&key) {
+    core.cooldowns.note_answer(&card.theme, unsatisfied, now);
+
+    if let Some(live) = core
+        .projects
+        .get_mut(&crate::state::project_key(&card.project_path))
+    {
+        // 知情度回答 → 记入项目事实(用户亲口回答,优先级最高)
+        if card.kind == "awareness" && !answer.is_empty() {
+            let entry = format!("用户回答(知情度):{answer}");
             if let Some(facts) = live.facts.as_mut() {
-                let entry = format!("用户回答(知情度):{answer}");
-                if !facts.awareness_facts.iter().any(|f| f == &entry) {
+                if !facts.awareness_facts.contains(&entry) {
                     facts.awareness_facts.push(entry);
-                    if let Some(pdir) = state_dir(&state, &card.project_path) {
-                        let _ = crate::memory::save_facts(&pdir, facts);
-                    }
+                    let _ =
+                        crate::memory::save_facts(&state.project_dir(&card.project_path), facts);
                 }
             }
         }
-    }
-    // 消费触发增量精炼(每 ≥20 次 → 异步合并)
-    if let Some(live) = core.projects.get_mut(&crate::state::project_key(&card.project_path)) {
+        // 消费计数驱动增量精炼(每 ≥20 次异步合并一次)
         live.consumed_since_merge += 1;
-        if live.consumed_since_merge >= 20 {
+        if live.consumed_since_merge >= FACTS_MERGE_EVERY {
             live.consumed_since_merge = 0;
-            let pdir = state_dir(&state, &card.project_path);
-            let facts = live.facts.clone();
-            drop_facts_kick(state, pdir, facts, card.project_path.clone());
+            if let Some(facts) = live.facts.clone() {
+                let state = state.clone();
+                let pdir = state.project_dir(&card.project_path);
+                // 脱离锁后再异步精炼,避免后台任务与当前命令争锁死锁
+                crate::memory::merge_kick(state, pdir, facts, card.project_path.clone());
+            }
         }
     }
-    // 移出队列并入历史(上限 500,丢最旧)
+    // 移出队列并入历史(上限 HISTORY_MAX,丢最旧)
     archive_card(&mut core, card.clone());
     crate::state::save_core_locked(&state.data_dir, &core);
     drop(core);
 
     crate::state::emit(&state.app, "card.updated", &card);
-
-    Ok(Some(card))
-}
-
-fn state_dir(state: &Arc<AppState>, project_path: &str) -> Option<PathBuf> {
-    Some(state.project_dir(project_path))
-}
-
-fn drop_facts_kick(state: &Arc<AppState>, pdir: Option<PathBuf>, facts: Option<crate::memory::Facts>, project_path: String) {
-    // 异步增量精炼(由 memory::merge_kick 完成;避免死锁:加载后脱离锁执行)
-    let state = state.clone();
-    let Some((pdir, facts)) = pdir.zip(facts) else { return };
-    crate::memory::merge_kick(state, pdir, facts, project_path);
+    Ok(card)
 }
 
 #[tauri::command]
@@ -383,14 +388,21 @@ pub fn queue_listen(state: tauri::State<'_, Arc<AppState>>) -> Vec<Card> {
 }
 
 #[tauri::command]
-pub fn queue_dismiss(state: tauri::State<'_, Arc<AppState>>, card_id: String) -> Result<(), String> {
+pub fn queue_dismiss(
+    state: tauri::State<'_, Arc<AppState>>,
+    card_id: String,
+) -> Result<(), String> {
     let state = state.inner().clone();
-    set_status_and_finish(&state, &card_id, "dismissed", "手动跳过".into(), false).map_err(|e| e.to_string())?;
+    set_status_and_finish(&state, &card_id, "dismissed", "手动跳过".into(), false)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn queue_mute_theme(state: tauri::State<'_, Arc<AppState>>, card_id: String) -> Result<(), String> {
+pub fn queue_mute_theme(
+    state: tauri::State<'_, Arc<AppState>>,
+    card_id: String,
+) -> Result<(), String> {
     let state = state.inner().clone();
     let theme = {
         let core = state.core.blocking_lock();
@@ -410,78 +422,74 @@ pub fn queue_mute_theme(state: tauri::State<'_, Arc<AppState>>, card_id: String)
     Ok(())
 }
 
-/// 回答卡片;不满意/自定义(非"满意")时生成下一轮优化提示词
+/// 回答卡片;审查卡被判"不满意/自定义"时,异步生成下一轮优化提示词
 #[tauri::command]
-pub fn queue_answer(state: tauri::State<'_, Arc<AppState>>, card_id: String, answer: String) -> Result<Card, String> {
+pub fn queue_answer(
+    state: tauri::State<'_, Arc<AppState>>,
+    card_id: String,
+    answer: String,
+) -> Result<Card, String> {
     let state = state.inner().clone();
-    let card = {
-        let core = state.core.blocking_lock();
-        core.queue
-            .iter()
-            .find(|c| c.id == card_id)
-            .cloned()
-            .ok_or_else(|| "卡片不存在".to_string())?
-    };
-
-    let want_prompt = card.kind == "review"
-        && (answer.starts_with("不满意") || answer.starts_with("自定义"))
-        && !answer.starts_with("满意");
-    let finished = set_status_and_finish(&state, &card_id, "answered", answer.clone(), want_prompt)
+    let asked_for_prompt = answer.starts_with(UNSATISFIED_MARK) || answer.starts_with("自定义");
+    let card = set_status_and_finish(&state, &card_id, "answered", answer, asked_for_prompt)
         .map_err(|e| e.to_string())?;
-    let Some(finished) = finished else {
-        return Ok(card);
-    };
 
-    if want_prompt {
+    // 占位符仍在,说明本卡确实需要(且已被登记为)生成优化提示词
+    if card.optimized_prompt == PROMPT_PENDING_MARK {
         // 异步生成优化提示词:写剪贴板 + 追加 .kvba/next-prompt.md
         let state = state.clone();
-        let f = finished.clone();
+        let pending_card = card.clone();
         tauri::async_runtime::spawn(async move {
-            if let Ok(prompt) = crate::llm::prompt::generate_optimized(&state, &f).await {
-                let mut core = state.core.blocking_lock();
-                for c in core.queue.iter_mut() {
-                    if c.id == f.id {
-                        c.optimized_prompt = prompt.clone();
-                        break;
-                    }
+            if let Ok(prompt) = crate::llm::prompt::generate_optimized(&state, &pending_card).await
+            {
+                {
+                    let mut core = state.core.blocking_lock();
+                    let mut hit = |c: &mut Card| {
+                        if c.id == pending_card.id {
+                            c.optimized_prompt = prompt.clone();
+                        }
+                    };
+                    core.queue.iter_mut().for_each(&mut hit);
+                    core.history.iter_mut().for_each(hit);
+                    crate::state::save_core_locked(&state.data_dir, &core);
                 }
-                for c in core.history.iter_mut() {
-                    if c.id == f.id {
-                        c.optimized_prompt = prompt.clone();
-                        break;
-                    }
-                }
-                crate::state::save_core(&state);
-                drop(core);
-                let mut updated = f.clone();
+                let mut updated = pending_card.clone();
                 updated.optimized_prompt = prompt;
                 crate::state::emit(&state.app, "prompt.generated", &updated);
             }
         });
     }
-    Ok(finished)
+    Ok(card)
 }
 
 /// LLM 分析通过(G7)后:生成卡片并推送;返回是否成功入队(供"来一道"回传真实结局)
-pub fn push_pass_card(app: &tauri::AppHandle, state: &Arc<AppState>, pass: &GatePass, analysis: crate::llm::AnalysisOut, ref_event_id: String) -> bool {
-    let project_path = analysis.project_path.clone().unwrap_or_default();
-    let core = state.core.blocking_lock();
-    let text = analysis.text.clone();
-    let ref_files = analysis.ref_files.clone();
+pub fn push_pass_card(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    pass: &GatePass,
+    analysis: crate::llm::AnalysisOut,
+    ref_event_id: String,
+) -> bool {
     let severity = analysis.severity.clone();
-    let kind = analysis.kind.clone();
     let theme = if analysis.theme.is_empty() {
         pass.theme_hint.clone()
     } else {
         analysis.theme.clone()
     };
-    let card = build_card(pass, text, ref_files, ref_event_id, project_path, &severity);
+    let card = build_card(
+        pass,
+        analysis.text.clone(),
+        analysis.ref_files.clone(),
+        ref_event_id,
+        analysis.project_path.clone().unwrap_or_default(),
+        &severity,
+    );
+    // LLM 对卡片类型/主题的判断优先于门控预判
     let card = Card {
-        kind,
+        kind: analysis.kind.clone(),
         theme,
         ..card
     };
-    drop(core);
 
     let app2 = app.clone();
     let inserted = insert_card(
@@ -534,7 +542,10 @@ mod tests {
         cd.note_answer("vue-lifecycle", true, 1000);
         assert!(!cd.is_muted("vue-lifecycle", 1000), "1 次不满意不应静默");
         cd.note_answer("vue-lifecycle", true, 1100);
-        assert!(cd.is_muted("vue-lifecycle", 1100), "连续 2 次不满意应静默 1h");
+        assert!(
+            cd.is_muted("vue-lifecycle", 1100),
+            "连续 2 次不满意应静默 1h"
+        );
         assert!(cd.is_muted("vue-lifecycle", 1100 + crate::gate::THEME_MUTE_SECS - 1));
         assert!(!cd.is_muted("vue-lifecycle", 1100 + crate::gate::THEME_MUTE_SECS + 1));
     }
@@ -552,28 +563,59 @@ mod tests {
     fn insert_card_respects_queue_cap_and_default_discards() {
         let mut core = Core::empty(Settings::default());
         for i in 0..3 {
-            assert!(insert_card(&mut core, mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")), &noop_emit()).is_some());
+            assert!(insert_card(
+                &mut core,
+                mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")),
+                &noop_emit()
+            )
+            .is_some());
         }
-        assert_eq!(core.queue.iter().filter(|c| c.status == "pending").count(), 3);
+        assert_eq!(
+            core.queue.iter().filter(|c| c.status == "pending").count(),
+            3
+        );
         // 队列满:默认配置下直接丢弃
-        assert!(insert_card(&mut core, mk_card("t3", "tips", "info", "f3.ts"), &noop_emit()).is_none());
+        assert!(insert_card(
+            &mut core,
+            mk_card("t3", "tips", "info", "f3.ts"),
+            &noop_emit()
+        )
+        .is_none());
         assert_eq!(core.queue.len(), 3);
     }
 
     #[test]
     fn insert_card_p0_replaces_oldest_when_allowed_and_archives() {
-        let mut core = Core::empty(Settings { p0_replace_queue: true, ..Default::default() });
+        let mut core = Core::empty(Settings {
+            p0_replace_queue: true,
+            ..Default::default()
+        });
         for i in 0..3 {
-            insert_card(&mut core, mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")), &noop_emit());
+            insert_card(
+                &mut core,
+                mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")),
+                &noop_emit(),
+            );
         }
         let before_history = core.history.len();
-        let r = insert_card(&mut core, mk_card("code-review", "review", "P0", "fx.ts"), &noop_emit());
+        let r = insert_card(
+            &mut core,
+            mk_card("code-review", "review", "P0", "fx.ts"),
+            &noop_emit(),
+        );
         assert!(r.is_some(), "P0 允许替换时应入队");
-        assert_eq!(core.queue.iter().filter(|c| c.status == "pending").count(), 3, "总数仍 ≤3");
+        assert_eq!(
+            core.queue.iter().filter(|c| c.status == "pending").count(),
+            3,
+            "总数仍 ≤3"
+        );
         // 被替换的卡归档进历史而不是留在队列里等重启丢失
         assert_eq!(core.history.len(), before_history + 1);
         assert!(core.history.iter().any(|c| c.status == "dismissed"));
-        assert_eq!(core.queue.iter().filter(|c| c.status != "pending").count(), 0);
+        assert_eq!(
+            core.queue.iter().filter(|c| c.status != "pending").count(),
+            0
+        );
     }
 
     #[test]
@@ -601,12 +643,18 @@ mod tests {
             archive_card(&mut core, c);
         }
         assert_eq!(core.history.len(), 500);
-        assert!(core.history.first().unwrap().theme != "tt0", "最旧的应被丢弃");
+        assert!(
+            core.history.first().unwrap().theme != "tt0",
+            "最旧的应被丢弃"
+        );
     }
 
     #[test]
     fn norm_path_unifies_separators_and_case() {
-        assert_eq!(norm_path("C:\\Proj\\SRC\\App.vue"), norm_path("c:/proj/src/app.VUE"));
+        assert_eq!(
+            norm_path("C:\\Proj\\SRC\\App.vue"),
+            norm_path("c:/proj/src/app.VUE")
+        );
         assert_ne!(norm_path("src/app.vue"), norm_path("other/src/app.vue"));
     }
 }
