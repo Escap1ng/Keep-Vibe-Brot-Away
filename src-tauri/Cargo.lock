@@ -2337,7 +2337,6 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
- "thiserror 2.0.20",
  "tokio",
  "uuid",
  "winreg 0.52.0",

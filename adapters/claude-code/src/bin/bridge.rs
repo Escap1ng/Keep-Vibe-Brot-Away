@@ -2,7 +2,7 @@
 //! 使用方式见 README:在 ~/.claude/settings.json 的 hooks 中配置本二进制路径。
 //! 失败静默,始终 0 退出,绝不阻塞 Agent。
 
-use kvba_adapters::common::{build_event, SeverityFlags};
+use kvba_adapters::common::{build_event, collect_files, scan_flags, EventSpec, SeverityFlags};
 use kvba_adapters::post_event;
 
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
@@ -12,7 +12,10 @@ fn main() {
     let mut raw = String::new();
     {
         use std::io::Read;
-        let _ = std::io::stdin().lock().take(MAX_STDIN_BYTES as u64).read_to_string(&mut raw);
+        let _ = std::io::stdin()
+            .lock()
+            .take(MAX_STDIN_BYTES as u64)
+            .read_to_string(&mut raw);
     }
     let hook: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
@@ -33,19 +36,9 @@ fn main() {
             let tool_input = hook["tool_input"].clone();
             let tool_response = hook["tool_response"].clone();
 
-            let mut files: Vec<String> = Vec::new();
-            if let Some(p) = tool_input["file_path"].as_str() {
-                files.push(p.to_string());
-            }
-            if let Some(list) = tool_input["file_paths"].as_array() {
-                for p in list {
-                    if let Some(p) = p.as_str() {
-                        files.push(p.to_string());
-                    }
-                }
-            }
+            let files = collect_files(&tool_input);
 
-            // diff/内容摘录
+            // diff/内容摘录:优先取 input 中最长的一段,皆空时回退 tool_response
             let mut diff = String::new();
             for key in ["diff", "patch", "newString", "content"] {
                 if let Some(s) = tool_input[key].as_str() {
@@ -75,51 +68,39 @@ fn main() {
                 intent = format!("执行 {tool_name}");
             }
 
-            let flags = detect_flags(&intent, &diff);
-            let line_delta = diff.lines().count() as i64;
-
-            build_event(
-                "claude-code-bridge",
-                "tool.completed",
-                &tool_name,
+            build_event(EventSpec {
+                emitter: "claude-code-bridge",
+                event_type: "tool.completed",
+                tool_name: &tool_name,
                 files,
-                &diff,
-                &intent,
-                flags.has_api_call,
-                flags.has_error_path,
-                flags.todo_or_fixme,
-                line_delta,
-                &cwd,
-                &session_id,
-            )
+                diff_head: &diff,
+                intent: &intent,
+                flags: scan_flags(&intent, &diff),
+                line_delta: diff.lines().count() as i64,
+                project_path: &cwd,
+                session_id: &session_id,
+            })
         }
-        "Stop" => build_event(
-            "claude-code-bridge",
-            "turn.ended",
-            "",
-            vec![],
-            "",
+        "Stop" => build_event(EventSpec {
+            emitter: "claude-code-bridge",
+            event_type: "turn.ended",
+            tool_name: "",
+            files: vec![],
+            diff_head: "",
             // stop_hook_active 是布尔;给出稳定 intent 便于门控与去重
-            if hook["stop_hook_active"].as_bool().unwrap_or(false) {
+            intent: if hook["stop_hook_active"].as_bool().unwrap_or(false) {
                 "回合结束(停止钩子应答)"
             } else {
                 "回合结束"
             },
-            false,
-            false,
-            false,
-            0,
-            &cwd,
-            &session_id,
-        ),
+            flags: SeverityFlags::default(),
+            line_delta: 0,
+            project_path: &cwd,
+            session_id: &session_id,
+        }),
         _ => return, // 其它 hook 事件本期不处理
     };
 
     let _ = post_event(&ev);
     // 结束后由 stdout 回显空,保证 hook 不被打断
-}
-
-fn detect_flags(intent: &str, diff: &str) -> SeverityFlags {
-    use kvba_adapters::common::scan_flags;
-    scan_flags(intent, diff)
 }

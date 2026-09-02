@@ -4,9 +4,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { Menu, MenuItem } from "@tauri-apps/api/menu";
-import { invoke } from "@tauri-apps/api/core";
-import type { Card } from "../lib/types";
+import { Menu, MenuItem, PredefinedMenuItem } from "@tauri-apps/api/menu";
 import { api } from "../lib/api";
 
 const win = getCurrentWindow();
@@ -125,19 +123,15 @@ async function onContextMenu(e: MouseEvent) {
         text: "隐藏胶囊(仅托盘)",
         action: () => api.capsuleHide(),
       }),
-      await MenuItem.new({ id: "sep", text: "─" }),
+      await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({
         id: "quit",
         text: "退出",
-        action: () => invokeQuit(),
+        action: () => api.quitApp(),
       }),
     ],
   });
   await menu.popup();
-}
-
-function invokeQuit() {
-  invoke("quit_app").catch(() => void 0);
 }
 
 onMounted(async () => {

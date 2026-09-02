@@ -1,10 +1,11 @@
 <script setup lang="ts">
 // 弹出面板:active(卡片横幅)/ popup(队列列表 ≤3 张)
 // 消费驱动:满意/不满意/自定义…/跳过/不再问这类;不满意 → 下一轮优化提示词(剪贴板 + .kvba/next-prompt.md)
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
+import { MAX_PENDING, PROMPT_PENDING_MARK } from "../lib/types";
 import type { Card } from "../lib/types";
 
 const win = getCurrentWindow();
@@ -20,7 +21,8 @@ let hideTimer: ReturnType<typeof setTimeout> | null = null;
 let unlisteners: Array<() => void> = [];
 
 const currentCard = computed(() => cards.value[current.value] ?? null);
-const shownCards = cards.value.slice(0, 3);
+// 必须是 computed:setup 期的一次性快照永远不会随队列刷新
+const shownCards = computed(() => cards.value.slice(0, MAX_PENDING));
 
 function showToast(msg: string) {
   toast.value = msg;
@@ -44,10 +46,8 @@ async function answer(card: Card, text: string) {
   working.value = true;
   try {
     const updated = await api.queueAnswer(card.id, text);
-    if (updated.optimizedPrompt === "(生成中)" || text.startsWith("不满意") || text.startsWith("自定义")) {
-      showToast("已生成「下一轮优化提示词」:复制到剪贴板并在 .kvba/next-prompt.md 归档");
-    } else if (!updated.answer.startsWith("满意")) {
-      showToast("");
+    if (updated.optimizedPrompt === PROMPT_PENDING_MARK) {
+      showToast("正在生成「下一轮优化提示词」:完成后写入剪贴板并归档到 .kvba/next-prompt.md");
     }
   } catch (e) {
     showToast(String(e));
@@ -105,7 +105,6 @@ function onKeyEsc(e: KeyboardEvent) {
   if (e.key === "Escape") closePanel();
 }
 
-let closed = false;
 function cancelAutoHide() {
   if (hideTimer) {
     clearTimeout(hideTimer);
@@ -116,6 +115,7 @@ function cancelAutoHide() {
 async function armAutoHide() {
   if (hideTimer) clearTimeout(hideTimer);
   hideTimer = setTimeout(async () => {
+    // 正在输入自定义答复时不收起,避免打断作答
     if (document.activeElement instanceof HTMLTextAreaElement) return;
     if (!document.hasFocus()) {
       await api.panelClose().catch(() => void 0);
@@ -126,45 +126,27 @@ async function armAutoHide() {
 
 onMounted(async () => {
   await refresh();
-  mode.value = "popup";
 
   unlisteners.push(
     await listen<{ mode: string }>("panel:show", async (e) => {
       await refresh();
       mode.value = (e.payload?.mode as "active" | "popup") || "popup";
-      if (mode.value === "active") {
-        current.value = 0;
-        if ('focus' in win) {
-          // 不抢焦点:面板不动焦点
-          void 0;
-        }
-      }
+      // active(新卡到达)从队首看起;popup 保留用户当前浏览位置
+      if (mode.value === "active") current.value = 0;
     }),
-    await listen<Card>("card.new", async () => {
-      await refresh();
-    }),
-    await listen("card.dismissed", async () => {
-      await refresh();
-    }),
-    await listen("card.updated", async () => {
-      await refresh();
-    }),
-    await listen("prompt.generated", () => {
-      // 提示词已入剪贴板
-    }),
+    await listen<Card>("card.new", refresh),
+    await listen("card.dismissed", refresh),
+    await listen("card.updated", refresh),
   );
 
   // 失焦自动收起(仅在面板曾获得焦点时可靠;未交互时由 ✕/ESC 兜底)
-  unlisteners.push(await win.onFocusChanged(({ payload }) => {
-    if (!payload) armAutoHide();
-  }));
+  unlisteners.push(
+    await win.onFocusChanged(({ payload }) => {
+      if (!payload) armAutoHide();
+    }),
+  );
   window.addEventListener("pointerdown", cancelAutoHide, true);
   window.addEventListener("keydown", onKeyEsc, true);
-  nextTick(() => {
-    if (mode.value === "popup" && cards.value.length > 0) {
-      // 已通过当前位置打开
-    }
-  });
 });
 
 onUnmounted(() => {
@@ -188,7 +170,7 @@ const kindLabel: Record<string, string> = { review: "审查", tips: "知识", aw
     >
       <div class="head-left">
         <span class="logo-mark"></span>
-        <span class="queue-info">队列 {{ cards.length }}/3</span>
+        <span class="queue-info">队列 {{ cards.length }}/{{ MAX_PENDING }}</span>
       </div>
       <div class="head-actions">
         <button class="kvba-btn text pressable head-tip" @click="askOne" :disabled="working">

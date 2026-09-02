@@ -11,7 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{now_ts, AppState};
 
+/// facts.json 体积上限(超出即分级收缩)
 pub const FACTS_MAX_BYTES: usize = 50 * 1024;
+/// 收缩时保留的最近决策条数
+const KEEP_DECISIONS: usize = 4;
+/// 收缩时保留的用户知情度事实条数
+const KEEP_AWARENESS: usize = 20;
+/// 收缩后目录概览的最小保留字符数
+const DIR_SUMMARY_FLOOR: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -33,30 +40,22 @@ pub fn facts_prompt_text(f: &Facts) -> String {
 }
 
 pub fn save_facts(pdir: &Path, facts: &Facts) -> anyhow::Result<()> {
-    let raw = serde_json::to_string_pretty(facts)?;
-    if raw.as_bytes().len() > FACTS_MAX_BYTES {
+    let mut raw = serde_json::to_string_pretty(facts)?;
+    if raw.len() > FACTS_MAX_BYTES {
         // 超限收缩顺序:先丢较旧的 decisions(可由事件流重新推导),
-        // awareness_facts 是用户亲口回答的知情度事实,仅保留最近 20 条;
-        // 最后才压缩 dir_summary。绝不整体清空用户事实。
+        // awareness_facts 是用户亲口回答的知情度事实,仅保留最近若干条;
+        // 最后才逐半压缩 dir_summary。绝不整体清空用户事实。
         let mut f = facts.clone();
-        if f.decisions.len() > 4 {
-            let cut = f.decisions.len() - 4;
-            f.decisions.drain(0..cut);
-        } else {
-            f.decisions.clear();
-        }
-        if f.awareness_facts.len() > 20 {
-            let cut = f.awareness_facts.len() - 20;
-            f.awareness_facts.drain(0..cut);
-        }
-        let mut raw2 = serde_json::to_string_pretty(&f)?;
-        while raw2.as_bytes().len() > FACTS_MAX_BYTES && f.dir_summary.chars().count() > 200 {
+        let cut = f.decisions.len().saturating_sub(KEEP_DECISIONS);
+        f.decisions.drain(0..cut);
+        let cut = f.awareness_facts.len().saturating_sub(KEEP_AWARENESS);
+        f.awareness_facts.drain(0..cut);
+        raw = serde_json::to_string_pretty(&f)?;
+        while raw.len() > FACTS_MAX_BYTES && f.dir_summary.chars().count() > DIR_SUMMARY_FLOOR {
             let half = f.dir_summary.chars().count() / 2;
             f.dir_summary = f.dir_summary.chars().take(half).collect();
-            raw2 = serde_json::to_string_pretty(&f)?;
+            raw = serde_json::to_string_pretty(&f)?;
         }
-        std::fs::write(pdir.join("facts.json"), raw2)?;
-        return Ok(());
     }
     std::fs::write(pdir.join("facts.json"), raw)?;
     Ok(())
@@ -108,7 +107,11 @@ pub fn scan_project(root: &Path) -> String {
                 (e.file_name().to_string_lossy().to_string(), ok)
             })
             .filter(|(n, _)| {
-                !n.starts_with('.') && !matches!(n.as_str(), "node_modules" | "target" | "dist" | "build" | "vendor")
+                !n.starts_with('.')
+                    && !matches!(
+                        n.as_str(),
+                        "node_modules" | "target" | "dist" | "build" | "vendor"
+                    )
             })
             .collect();
         names.sort();
@@ -117,9 +120,16 @@ pub fn scan_project(root: &Path) -> String {
                 tree.push_str("…(截断)");
                 break;
             }
-            tree.push_str(&if is_dir { format!("{name}/\n") } else { format!("{name}\n") });
+            tree.push_str(&if is_dir {
+                format!("{name}/\n")
+            } else {
+                format!("{name}\n")
+            });
             count += 1;
-            if is_dir && count < MAX_TREE_ENTRIES && matches!(name.as_str(), "src" | "app" | "lib" | "pages") {
+            if is_dir
+                && count < MAX_TREE_ENTRIES
+                && matches!(name.as_str(), "src" | "app" | "lib" | "pages")
+            {
                 if let Ok(sub) = std::fs::read_dir(root.join(&name)) {
                     let mut subnames: Vec<String> = sub
                         .filter_map(|e| e.ok())
@@ -143,33 +153,48 @@ pub fn scan_project(root: &Path) -> String {
     out
 }
 
-/// 会话结束:有消费记录(<20 也应触发一次增量合并)时异步精炼
+/// 会话结束:已生成过 facts 或有未精炼的消费记录时,异步做一次增量合并
 pub fn session_merge(state: &Arc<AppState>, project_path: &str) {
     let (pdir, facts) = {
         let core = state.core.blocking_lock();
-        let key = crate::state::project_key(project_path);
-        match core.projects.get(&key) {
-            Some(live) if live.consumed_since_merge > 0 => {
-                (state.project_dir(project_path), live.facts.clone())
-            }
-            Some(live) if live.facts.is_some() => {
+        match core.projects.get(&crate::state::project_key(project_path)) {
+            Some(live) if live.consumed_since_merge > 0 || live.facts.is_some() => {
                 (state.project_dir(project_path), live.facts.clone())
             }
             _ => return,
         }
     };
     let Some(facts) = facts else { return };
-    let mut core = state.core.blocking_lock();
-    if let Some(live) = core.projects.get_mut(&crate::state::project_key(project_path)) {
-        live.consumed_since_merge = 0;
+    {
+        let mut core = state.core.blocking_lock();
+        if let Some(live) = core
+            .projects
+            .get_mut(&crate::state::project_key(project_path))
+        {
+            live.consumed_since_merge = 0;
+        }
     }
-    drop(core);
     merge_kick(state.clone(), pdir, facts, project_path.to_string());
+}
+
+/// 精炼结果统一出口:盖时间戳 → 落盘 → 写回内存窗口 → 广播前端
+fn publish_facts(state: &Arc<AppState>, pdir: &Path, project_path: &str, mut facts: Facts) {
+    facts.generated_at = now_ts();
+    let _ = save_facts(pdir, &facts);
+    {
+        let mut core = state.core.blocking_lock();
+        core.project_live(project_path).facts = Some(facts);
+    }
+    crate::state::emit(
+        &state.app,
+        "facts.updated",
+        &serde_json::json!({ "ok": true }),
+    );
 }
 
 /// 由摄入管线调用:新项目且无 facts → 调度异步生成首版(扫描 + 一次 LLM 调用)
 pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
-    let project: String = project_path.to_string();
+    let project = project_path.to_string();
     {
         let core = state.core.blocking_lock();
         let key = crate::state::project_key(&project);
@@ -179,7 +204,7 @@ pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
             }
         }
     }
-    // 重启后已存在 facts.json → 直接载入
+    // 重启后已存在 facts.json → 直接载入,不再花一次 LLM 调用
     let pdir = state.project_dir(&project);
     if let Some(facts) = load_facts(&pdir) {
         let mut core = state.core.blocking_lock();
@@ -199,17 +224,13 @@ pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
         )
         .await
         {
-            Ok(text) => {
-                if let Some(mut facts) = crate::llm::parse_contract_facts(&text) {
-                    facts.generated_at = now_ts();
+            Ok(text) => match crate::llm::parse_contract_facts(&text) {
+                Some(facts) => {
                     let pdir = state.project_dir(&project);
-                    let _ = save_facts(&pdir, &facts);
-                    let mut core = state.core.blocking_lock();
-                    core.project_live(&project).facts = Some(facts);
-                    drop(core);
-                    crate::state::emit(&state.app, "facts.updated", &serde_json::json!({ "ok": true }));
+                    publish_facts(&state, &pdir, &project, facts);
                 }
-            }
+                None => log::warn!("facts 首版返回不可解析的 JSON,已跳过"),
+            },
             Err(e) => {
                 log::warn!("facts 首版生成失败(不影响主流程):{e}");
             }
@@ -218,7 +239,12 @@ pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
 }
 
 /// 增量精炼:每消费 ≥20 次问题 或项目会话结束时调用(固定提示词,<=1 次)
-pub fn merge_kick(state: Arc<AppState>, pdir: std::path::PathBuf, facts: Facts, project_path: String) {
+pub fn merge_kick(
+    state: Arc<AppState>,
+    pdir: std::path::PathBuf,
+    facts: Facts,
+    project_path: String,
+) {
     tauri::async_runtime::spawn(async move {
         // 取增量信号:仅该项目的最近事件意图(避免跨项目混采)
         let signals = {
@@ -249,23 +275,10 @@ pub fn merge_kick(state: Arc<AppState>, pdir: std::path::PathBuf, facts: Facts, 
         )
         .await
         {
-            Ok(text) => {
-                if let Some(merged) = crate::llm::parse_contract_facts(&text) {
-                    let mut m = merged;
-                    m.generated_at = now_ts();
-                    let _ = save_facts(&pdir, &m);
-                    let key = pdir
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let mut core = state.core.blocking_lock();
-                    if let Some(live) = core.projects.get_mut(&key) {
-                        live.facts = Some(m);
-                    }
-                    drop(core);
-                    crate::state::emit(&state.app, "facts.updated", &serde_json::json!({ "ok": true }));
-                }
-            }
+            Ok(text) => match crate::llm::parse_contract_facts(&text) {
+                Some(merged) => publish_facts(&state, &pdir, &project_path, merged),
+                None => log::warn!("facts 增量合并返回不可解析的 JSON,已跳过"),
+            },
             Err(e) => {
                 log::warn!("facts 增量合并失败:{e}");
             }
@@ -286,7 +299,10 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = tmp_dir("roundtrip");
-        let f = Facts { framework: "Nuxt3".into(), ..Default::default() };
+        let f = Facts {
+            framework: "Nuxt3".into(),
+            ..Default::default()
+        };
         save_facts(&dir, &f).unwrap();
         let got = load_facts(&dir).unwrap();
         assert_eq!(got.framework, "Nuxt3");
@@ -296,19 +312,31 @@ mod tests {
     #[test]
     fn shrink_on_overflow_keeps_recent_awareness_and_limits_decisions() {
         let dir = tmp_dir("shrink");
-        let mut f = Facts::default();
-        f.decisions = (0..30).map(|i| format!("决策{i}:{}", "d".repeat(400))).collect();
-        f.awareness_facts = (0..30).map(|i| format!("用户事实{i}:{}", "a".repeat(400))).collect();
-        f.dir_summary = "s".repeat(70 * 1024); // 单字段即超限
+        let f = Facts {
+            decisions: (0..30)
+                .map(|i| format!("决策{i}:{}", "d".repeat(400)))
+                .collect(),
+            awareness_facts: (0..30)
+                .map(|i| format!("用户事实{i}:{}", "a".repeat(400)))
+                .collect(),
+            dir_summary: "s".repeat(70 * 1024), // 单字段即超限
+            ..Default::default()
+        };
         save_facts(&dir, &f).unwrap();
 
         let raw = std::fs::read_to_string(dir.join("facts.json")).unwrap();
-        assert!(raw.as_bytes().len() <= FACTS_MAX_BYTES + 1024, "超限应被收缩到约 50KB 内");
+        assert!(
+            raw.len() <= FACTS_MAX_BYTES + 1024,
+            "超限应被收缩到约 50KB 内"
+        );
         let got = load_facts(&dir).unwrap();
         // 用户回答的知情度事实必须保留(最多 20 条),决策收缩到 ≤4 条
         assert!(!got.awareness_facts.is_empty(), "知情度事实不得整体清空");
         assert!(got.awareness_facts.len() <= 20);
-        assert!(got.awareness_facts.last().unwrap().contains("用户事实29"), "应保留最新的");
+        assert!(
+            got.awareness_facts.last().unwrap().contains("用户事实29"),
+            "应保留最新的"
+        );
         assert!(got.decisions.len() <= 4);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<替换为本仓库的绝对路径>\\adapters\\trae-hook\\kvba-trae-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<替换为本仓库的绝对路径>\\adapters\\trae-hook\\kvba-trae-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

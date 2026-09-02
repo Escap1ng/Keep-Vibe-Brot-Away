@@ -32,7 +32,6 @@ hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.8"
 chrono = "0.4"
-thiserror = "2"
 futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]

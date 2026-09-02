@@ -57,7 +57,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            crate::windows::capsule_set_state,
             crate::windows::dock_snap,
             crate::windows::panel_open,
             crate::windows::panel_close,

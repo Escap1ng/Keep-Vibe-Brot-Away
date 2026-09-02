@@ -2,8 +2,8 @@
 //!
 //! secrets.enc 结构(JSON):{ salt, nonce, data } 其中 data = AES-GCM(keys_json)
 
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -30,8 +30,11 @@ pub fn machine_id() -> String {
             }
         }
         // 兜底:基于环境+架构的指纹(质量较低但可用)
-        let fallback = format!("{}-{:?}", std::env::var("COMPUTERNAME").unwrap_or_default(), std::env::consts::ARCH);
-        return fallback;
+        format!(
+            "{}-{:?}",
+            std::env::var("COMPUTERNAME").unwrap_or_default(),
+            std::env::consts::ARCH
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -67,13 +70,15 @@ pub fn machine_id() -> String {
 pub fn derive_key(machine_id: &str, salt: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(salt), machine_id.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"kvba-v2-secrets", &mut key).expect("HKDF 不能失败");
+    hk.expand(b"kvba-v2-secrets", &mut key)
+        .expect("HKDF 不能失败");
     key
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct KeysFile {
-    #[serde(default)] pub keys: HashMap<String, String>,
+    #[serde(default)]
+    pub keys: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,18 +88,19 @@ pub struct SecretEnvelope {
     pub data: String,
 }
 
+/// 十六进制编解码(secrets.enc 以 JSON 存放,故需可打印编码)
 fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+// 取模写法保持 README 声明的 Rust 1.77 下限(is_multiple_of 需 1.87+)
+#[allow(clippy::manual_is_multiple_of)]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
     (0..s.len() / 2)
-        .map(|i| {
-            u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()
-        })
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
         .collect()
 }
 
@@ -164,14 +170,15 @@ impl Keyring {
             .cloned()
     }
 
+    /// 写入 / 清空(key 为空即删除条目)某个 provider 的密钥
     pub fn set(&self, provider: &str, key: &str) -> anyhow::Result<()> {
         let mut keys = self.load();
-        keys.keys.insert(provider.to_string(), key.to_string());
+        if key.is_empty() {
+            keys.keys.remove(provider);
+        } else {
+            keys.keys.insert(provider.to_string(), key.to_string());
+        }
         self.save(&keys)
-    }
-
-    pub fn has_any(&self) -> bool {
-        self.load().keys.values().any(|v| !v.is_empty())
     }
 
     /// 返回"已配 key 的 provider" 列表(不泄漏密钥本体)
@@ -185,28 +192,26 @@ impl Keyring {
     }
 }
 
-/// 设置面板保存密钥
+/// 设置面板保存密钥(留空 = 清除该 provider 的密钥)
 #[tauri::command]
 pub fn secrets_put(
     state: tauri::State<'_, std::sync::Arc<crate::state::AppState>>,
     provider: String,
     key: String,
 ) -> Result<(), String> {
-    let dir = state.data_dir.clone();
-    let ring = Keyring::new(&dir);
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        // 清空
-        let _ = ring.set(&provider, "");
-    } else {
-        ring.set(&provider, &key).map_err(|e| format!("写入失败:{e}"))?;
+    if !PROVIDERS.contains(&provider.as_str()) {
+        return Err(format!("不支持的 provider:{provider}"));
     }
-    Ok(())
+    let ring = Keyring::new(&state.data_dir);
+    ring.set(&provider, key.trim())
+        .map_err(|e| format!("写入失败:{e}"))
 }
 
 /// 测试是否已配置 provider(用于设置面板显示,不返回密钥)
 #[tauri::command]
-pub fn secrets_test(state: tauri::State<'_, std::sync::Arc<crate::state::AppState>>) -> Vec<String> {
+pub fn secrets_test(
+    state: tauri::State<'_, std::sync::Arc<crate::state::AppState>>,
+) -> Vec<String> {
     let ring = Keyring::new(&state.data_dir);
     ring.present_providers()
 }

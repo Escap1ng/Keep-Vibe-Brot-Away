@@ -53,8 +53,10 @@ impl Default for AnalysisOut {
 impl AnalysisOut {
     /// 无 LLM 环境下的确定性降级卡(仍可形成认知价值)
     pub fn fallback(pass: &GatePass, project_path: &str) -> Self {
-        let mut out = AnalysisOut::default();
-        out.project_path = Some(project_path.to_string());
+        let mut out = Self {
+            project_path: Some(project_path.to_string()),
+            ..Default::default()
+        };
         match pass.branch {
             crate::gate::Branch::Review => {
                 out.kind = "review".into();
@@ -66,13 +68,16 @@ impl AnalysisOut {
                 out.kind = "awareness".into();
                 out.severity = "info".into();
                 out.theme = "framework-unknown".into();
-                out.text = "你知道这个项目现在用什么框架吗?回答后我会记住,并在之后按此讲解相关知识点。".into();
+                out.text =
+                    "你知道这个项目现在用什么框架吗?回答后我会记住,并在之后按此讲解相关知识点。"
+                        .into();
             }
             crate::gate::Branch::Knowledge => {
                 out.kind = "tips".into();
                 out.severity = "info".into();
                 out.theme = pass.theme_hint.clone();
-                out.text = "间隙小贴士:趁 Agent 干活,回顾一下这个主题的知识点(详见下次贴士)。".into();
+                out.text =
+                    "间隙小贴士:趁 Agent 干活,回顾一下这个主题的知识点(详见下次贴士)。".into();
             }
         }
         out
@@ -105,24 +110,20 @@ pub fn fit_tokens(s: &str, max_tokens: usize) -> String {
         if estimate_tokens(&tmp) <= max_tokens {
             return format!("{}…(截断)", tmp);
         }
-        len = len / 2;
+        len /= 2;
     }
     String::new()
 }
 
+/// 是否已具备调用 LLM 的最小配置(模型名 + 对应 provider 的 key)
 pub fn is_configured(state: &Arc<AppState>) -> bool {
-    let core = state.core.blocking_lock();
-    let settings = core.settings.clone();
-    drop(core);
-    if settings.model.trim().is_empty() {
-        return false;
-    }
-    let ring = crate::crypto::Keyring::new(&state.data_dir);
-    ring.get(&settings.provider).map(|k| !k.is_empty()).unwrap_or(false)
+    config_checked(state).is_ok()
 }
 
 /// 收集并校验当前 LLM 配置
-pub fn config_checked(state: &Arc<AppState>) -> Result<(String, String, Option<String>, String), String> {
+pub fn config_checked(
+    state: &Arc<AppState>,
+) -> Result<(String, String, Option<String>, String), String> {
     let core = state.core.blocking_lock();
     let settings = core.settings.clone();
     drop(core);
@@ -136,6 +137,14 @@ pub fn config_checked(state: &Arc<AppState>) -> Result<(String, String, Option<S
     Ok((settings.provider, settings.model, settings.base_url, key))
 }
 
+/// 统一的 LLM HTTP 客户端(仅连接超时;整体超时由单次请求设定)
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// 通用流式对话:聚合全部文本并返回
 pub async fn chat_complete(
     state: &Arc<AppState>,
@@ -144,10 +153,12 @@ pub async fn chat_complete(
     max_output_tokens: u32,
 ) -> Result<String, String> {
     let (provider, model, base_url, key) = config_checked(state)?;
-    let budget_ok = budget::check_then_inc(state);
-    if let Err(budget::BudgetErr::Exceeded) = budget_ok {
+    if let Err(budget::BudgetErr::Exceeded) = budget::check_then_inc(state) {
         budget_toast_once(state);
-        return Err(format!("{} 今日预算已用尽,进入攒批(仅累计信号,不调用 LLM)", budget::BUDGET_EXCEEDED_PREFIX));
+        return Err(format!(
+            "{} 今日预算已用尽,进入攒批(仅累计信号,不调用 LLM)",
+            budget::BUDGET_EXCEEDED_PREFIX
+        ));
     }
 
     let req = providers::ChatRequest {
@@ -155,15 +166,14 @@ pub async fn chat_complete(
         user: user.to_string(),
         max_output_tokens,
     };
+    let client = http_client()?;
 
     // 指数退避重试 ≤2 次(共 3 次尝试)
-    let mut last_err = String::new();
+    let mut last_err = "端点连通但返回为空(无有效内容增量)".to_string();
     for attempt in 0..3 {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())?;
-        match providers::stream_chat(&client, &provider, &model, base_url.as_deref(), &key, &req).await {
+        match providers::stream_chat(&client, &provider, &model, base_url.as_deref(), &key, &req)
+            .await
+        {
             Ok(mut stream) => {
                 let mut text = String::new();
                 while let Some(chunk) = stream.next().await {
@@ -182,8 +192,7 @@ pub async fn chat_complete(
             Err(e) => last_err = e.to_string(),
         }
         if attempt < 2 {
-            let wait_ms = 800u64 << attempt;
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(800u64 << attempt)).await;
         }
     }
     Err(format!("LLM 调用失败(已重试):{last_err}"))
@@ -239,7 +248,11 @@ pub async fn analyze_pass(state: &Arc<AppState>, pass: &GatePass) -> Result<Anal
 }
 
 /// G7 执行入口(指定项目版):供攒批消费时使用——攒批项可能在活动项目切换后才被消费
-pub async fn analyze_pass_for_project(state: &Arc<AppState>, pass: &GatePass, project_path: &str) -> Result<AnalysisOut, String> {
+pub async fn analyze_pass_for_project(
+    state: &Arc<AppState>,
+    pass: &GatePass,
+    project_path: &str,
+) -> Result<AnalysisOut, String> {
     let snapshot = snapshot_for_analysis(state, pass, project_path);
 
     let system = prompt::system_role();
@@ -251,7 +264,9 @@ pub async fn analyze_pass_for_project(state: &Arc<AppState>, pass: &GatePass, pr
         return Ok(normalize_out(out, pass, &snapshot));
     }
     // 解析失败:重试一次(更严格提示)。注意:重试会再占一格当日预算。
-    let strict = format!("{user}\n\n注意:请只返回一个 JSON 对象,不要包含任何其他文字、不要用 markdown 代码块包裹。");
+    let strict = format!(
+        "{user}\n\n注意:请只返回一个 JSON 对象,不要包含任何其他文字、不要用 markdown 代码块包裹。"
+    );
     let text2 = chat_complete(state, &system, &strict, 800).await?;
     if let Some(out) = parse_contract(&text2) {
         return Ok(normalize_out(out, pass, &snapshot));
@@ -268,7 +283,9 @@ fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot)
     if out.kind.is_empty() {
         out.kind = match branch {
             crate::gate::Branch::Review => "review".into(),
-            crate::gate::Branch::Knowledge if pass.theme_hint == "framework-unknown" => "awareness".into(),
+            crate::gate::Branch::Knowledge if pass.theme_hint == "framework-unknown" => {
+                "awareness".into()
+            }
             crate::gate::Branch::Knowledge => "tips".into(),
         };
     }
@@ -276,7 +293,10 @@ fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot)
         out.theme = pass.theme_hint.clone();
     }
     if out.options.is_empty() {
-        out.options = crate::queue::PENDING_OPTIONS.iter().map(|s| s.to_string()).collect();
+        out.options = crate::queue::PENDING_OPTIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
     }
     if out.ref_files.is_empty() {
         out.ref_files = snap.ref_files.clone();
@@ -301,7 +321,11 @@ pub struct AnalysisSnapshot {
     pub ref_files: Vec<String>,
 }
 
-fn snapshot_for_analysis(state: &Arc<AppState>, pass: &GatePass, project_path: &str) -> AnalysisSnapshot {
+fn snapshot_for_analysis(
+    state: &Arc<AppState>,
+    pass: &GatePass,
+    project_path: &str,
+) -> AnalysisSnapshot {
     let mut snap = AnalysisSnapshot {
         project_path: String::new(),
         facts_text: String::new(),
@@ -336,14 +360,24 @@ fn snapshot_for_analysis(state: &Arc<AppState>, pass: &GatePass, project_path: &
         snap.facts_text = crate::memory::facts_prompt_text(f);
     }
     // 对话记忆:最近 3 条
-    snap.dialog_text = live.dialog.iter().cloned().collect::<Vec<_>>().join("\n---\n");
+    snap.dialog_text = live
+        .dialog
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n---\n");
     // diff 摘录:最近事件
     snap.diff_text = live
         .events
         .iter()
         .rev()
         .take(2)
-        .map(|e| format!("[{}:{}]\n{}", e.tool_name, e.event_type, e.excerpt.diff_head))
+        .map(|e| {
+            format!(
+                "[{}:{}]\n{}",
+                e.tool_name, e.event_type, e.excerpt.diff_head
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     drop(core);
@@ -368,18 +402,16 @@ pub async fn llm_test_connection(
 ) -> Result<String, String> {
     let state = state.inner().clone();
     let (provider, model, base, key) = config_checked(&state)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client()?;
     let req = providers::ChatRequest {
         system: "你是回声机".into(),
         user: "只回复两个字母:OK".into(),
         max_output_tokens: 8,
     };
-    let mut stream = providers::stream_chat(&client, &provider, &model, base.as_deref(), &key, &req)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut stream =
+        providers::stream_chat(&client, &provider, &model, base.as_deref(), &key, &req)
+            .await
+            .map_err(|e| e.to_string())?;
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
         match chunk {

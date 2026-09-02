@@ -98,10 +98,7 @@ fn snapshot_ref_diff(state: &Arc<AppState>, card: &Card) -> String {
 fn sanitize_prompt(raw: &str) -> String {
     let mut t = raw.trim().to_string();
     // 剥掉可能的引号/代码块
-    let t2 = t
-        .trim_start_matches('`')
-        .trim_start_matches("修复")
-        .trim();
+    let t2 = t.trim_start_matches('`').trim_start_matches("修复").trim();
     t = format!("修复 {t2}");
     let t = t.replace("```", "");
     if t.chars().count() > 120 {
@@ -112,7 +109,11 @@ fn sanitize_prompt(raw: &str) -> String {
 }
 
 fn fallback_optimized(card: &Card) -> String {
-    let file = card.ref_files.first().cloned().unwrap_or_else(|| "相关文件".into());
+    let file = card
+        .ref_files
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "相关文件".into());
     format!("修复 {file}:检查本次改动中边界条件与异常处理是否完整;补充关键注释并在接入 API 处添加 try/catch。")
 }
 
@@ -141,5 +142,9 @@ fn write_prompt_outputs(state: &Arc<AppState>, card: &Card, prompt: &str) {
             let _ = f.write_all(line.as_bytes());
         }
     }
-    crate::state::emit(&app, "prompt.generated", &serde_json::json!({ "prompt": prompt }));
+    crate::state::emit(
+        &app,
+        "prompt.generated",
+        &serde_json::json!({ "prompt": prompt }),
+    );
 }

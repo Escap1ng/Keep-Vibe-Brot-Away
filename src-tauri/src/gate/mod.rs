@@ -18,6 +18,12 @@ pub const LAST_CARD_WINDOW_SECS: i64 = 60;
 pub const THEME_COOLDOWN_SECS: i64 = 30 * 60;
 pub const THEME_MUTE_SECS: i64 = 60 * 60;
 pub const DEDUP_WINDOW_SECS: i64 = 60 * 60; // 历史去重窗口(1h)
+/// G3 活性窗口:近 90s 内无事件即视为"Agent 空闲",不触发评估
+pub const ACTIVITY_WINDOW_SECS: i64 = 90;
+/// 决策日志内存窗口条数
+pub const DECISION_LOG_KEEP: usize = 200;
+/// 决策日志落盘超过该行号才整写修剪(append 为主,修剪为辅)
+pub const DECISION_LOG_TRIM_AT: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Branch {
@@ -197,7 +203,10 @@ pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
         }
         // 减分:纯文档变更
         let docs = !ex.files.is_empty()
-            && ex.files.iter().all(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"));
+            && ex
+                .files
+                .iter()
+                .all(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"));
         if docs {
             s.score -= 30;
             s.penalized.push("纯 README/文档变更(-30)".into());
@@ -217,7 +226,9 @@ pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
         && !events
             .iter()
             .any(|e| e.excerpt.diff_head.to_lowercase().contains("catch"));
-    let coverage_short = intent_pool.contains("不完整") || intent_pool.contains("未覆盖") || intent_pool.contains("无覆盖");
+    let coverage_short = intent_pool.contains("不完整")
+        || intent_pool.contains("未覆盖")
+        || intent_pool.contains("无覆盖");
     let p0 = network_no_guard || coverage_short;
     s.p0 = p0;
     s
@@ -238,7 +249,8 @@ pub fn theme_from_facts(facts: &Facts) -> String {
     if f.contains("tauri") || f.contains("rust") {
         return "rust-ownership".into();
     }
-    if f.contains("nest") || f.contains("express") || f.contains("fastify") || f.contains("laravel") {
+    if f.contains("nest") || f.contains("express") || f.contains("fastify") || f.contains("laravel")
+    {
         return "backend-async".into();
     }
     pool_pick(facts.framework.as_str())
@@ -258,15 +270,16 @@ pub fn pool_pick(seed: &str) -> String {
     TIP_POOL[idx].to_string()
 }
 
-/// 预判知识主题(G2 冷却判定用)
+/// 预判知识主题(G2 冷却判定用):仅在会路由到知识分支时才需要
 fn prefer_theme(ctx: &GateContext) -> Option<String> {
-    let has_write = ctx.events.iter().any(is_write_event);
-    let has_turn_end = ctx.events.iter().any(|e| e.event_type == "turn.ended");
-    let has_think = ctx.events.iter().any(|e| e.tool_name == "think");
-    if has_write {
+    if ctx.events.iter().any(is_write_event) {
         return None;
     }
-    if !has_turn_end && !has_think {
+    let has_knowledge_signal = ctx
+        .events
+        .iter()
+        .any(|e| e.event_type == "turn.ended" || e.tool_name == "think");
+    if !has_knowledge_signal {
         return None;
     }
     match ctx.facts {
@@ -298,9 +311,15 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
     let scoring = signal_score(&ctx.events);
 
     // G1 队列硬闸(即使"来一道"强制也不破队列上限)
-    if ctx.queue_len >= 3 {
+    if ctx.queue_len >= crate::queue::MAX_PENDING {
         return (
-            GateVerdict::Reject(GateLevel::G1, "队列已满(pending≥3),停止一切触发".into()),
+            GateVerdict::Reject(
+                GateLevel::G1,
+                format!(
+                    "队列已满(pending≥{}),停止一切触发",
+                    crate::queue::MAX_PENDING
+                ),
+            ),
             scoring,
         );
     }
@@ -342,23 +361,33 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
 
     // G4 分支路由
     let has_write = ctx.events.iter().any(is_write_event);
-    let has_turn_end = ctx.events.iter().any(|e| e.event_type == "turn.ended");
-    let has_think = ctx.events.iter().any(|e| e.tool_name == "think");
+    let has_knowledge_signal = ctx
+        .events
+        .iter()
+        .any(|e| e.event_type == "turn.ended" || e.tool_name == "think");
     let branch: Branch = if has_write {
         Branch::Review
-    } else if has_turn_end {
-        Branch::Knowledge
-    } else if has_think {
-        Branch::Knowledge
-    } else if ctx.force {
-        // "来一道":用户主动要求,即使无事件也走知识分支
+    } else if has_knowledge_signal || ctx.force {
+        // force = "来一道":用户主动要求,即使无事件也走知识分支
         Branch::Knowledge
     } else {
         return (
-            GateVerdict::Reject(GateLevel::G4, "无可路由信号(无写事件/turn.ended/think)".into()),
+            GateVerdict::Reject(
+                GateLevel::G4,
+                "无可路由信号(无写事件/turn.ended/think)".into(),
+            ),
             scoring,
         );
     };
+
+    // 首个引用文件:参与 G6 指纹(两分支同规则),故提前取出
+    let ref_file = ctx
+        .events
+        .iter()
+        .flat_map(|e| e.excerpt.files.iter())
+        .next()
+        .cloned()
+        .unwrap_or_default();
 
     match branch {
         Branch::Review => {
@@ -371,13 +400,6 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
                     scoring,
                 );
             }
-            let ref_file = ctx
-                .events
-                .iter()
-                .flat_map(|e| e.excerpt.files.iter())
-                .next()
-                .cloned()
-                .unwrap_or_default();
             if dedup_hit(ctx, Branch::Review, "code-review", &ref_file) {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "审查指纹与队列/历史重复".into()),
@@ -408,13 +430,6 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
                     scoring,
                 );
             }
-            let ref_file = ctx
-                .events
-                .iter()
-                .flat_map(|e| e.excerpt.files.iter())
-                .next()
-                .cloned()
-                .unwrap_or_default();
             if dedup_hit(ctx, Branch::Knowledge, &theme, &ref_file) {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "知识卡指纹与队列/历史重复".into()),
@@ -455,7 +470,10 @@ pub async fn gate_tick(
         }
         let pending = core.queue.iter().filter(|c| c.status == "pending").count();
         if pending >= crate::queue::MAX_PENDING {
-            return Err(format!("队列已满({pending}/3):先回答或跳过卡片,再来一道"));
+            return Err(format!(
+                "队列已满({pending}/{}):先回答或跳过卡片,再来一道",
+                crate::queue::MAX_PENDING
+            ));
         }
         if core.active_project.is_none() {
             return Err("暂无项目活动:让 Agent 干一点活,或确认适配器已接入".into());
@@ -495,6 +513,8 @@ mod tests {
     use crate::memory::Facts;
     use crate::queue::{Card, CooldownMap};
 
+    /// 事件夹具工厂(测试专用:参数即 Excerpt 字段,展开比 builder 更直观)
+    #[allow(clippy::too_many_arguments)]
     fn ev(
         event_type: &str,
         tool: &str,
@@ -528,6 +548,8 @@ mod tests {
         }
     }
 
+    /// 门控上下文夹具(测试专用:一次性覆盖全部输入维度)
+    #[allow(clippy::too_many_arguments)]
     fn ctx<'a>(
         events: Vec<NormalizedEvent>,
         queue_len: usize,
@@ -604,8 +626,21 @@ mod tests {
     fn g2_theme_cooldown_rejects() {
         let mut cd = CooldownMap::default();
         cd.touch_asked("vue-lifecycle", 100);
-        let facts = Facts { framework: "Vue3".into(), ..Default::default() };
-        let events = vec![ev("turn.ended", "think", 0, vec![], "", "总结", false, false, false)];
+        let facts = Facts {
+            framework: "Vue3".into(),
+            ..Default::default()
+        };
+        let events = vec![ev(
+            "turn.ended",
+            "think",
+            0,
+            vec![],
+            "",
+            "总结",
+            false,
+            false,
+            false,
+        )];
         // now=1500,距上次问询 1400s < 30min=1800s → G2 拒绝
         let (v, _) = evaluate(&ctx(events, 0, None, &cd, Some(&facts), &[], &[], 1500));
         assert!(matches!(v, GateVerdict::Reject(GateLevel::G2, _)));
@@ -622,7 +657,15 @@ mod tests {
     fn g4_no_route_rejects() {
         let cd = CooldownMap::default();
         let events = vec![ev(
-            "message.updated", "read", 3, vec![], "", "看文件", false, false, false,
+            "message.updated",
+            "read",
+            3,
+            vec![],
+            "",
+            "看文件",
+            false,
+            false,
+            false,
         )];
         let (v, _) = evaluate(&ctx(events, 0, None, &cd, None, &[], &[], 2000));
         assert!(matches!(v, GateVerdict::Reject(GateLevel::G4, _)));
@@ -674,7 +717,6 @@ mod tests {
             true,
             false,
         )];
-        let _ = &events;
         let (v, s) = evaluate(&ctx(events, 0, None, &cd, None, &[], &[], 2000));
         match v {
             GateVerdict::Pass(p) => {
@@ -689,7 +731,17 @@ mod tests {
     #[test]
     fn g5_b_framework_unknown_awareness() {
         let cd = CooldownMap::default();
-        let events = vec![ev("turn.ended", "think", 0, vec![], "", "这轮改完了", false, false, false)];
+        let events = vec![ev(
+            "turn.ended",
+            "think",
+            0,
+            vec![],
+            "",
+            "这轮改完了",
+            false,
+            false,
+            false,
+        )];
         let (v, _) = evaluate(&ctx(events, 0, None, &cd, None, &[], &[], 2000));
         match v {
             GateVerdict::Pass(p) => {
@@ -703,8 +755,21 @@ mod tests {
     #[test]
     fn g5_b_framework_tip() {
         let cd = CooldownMap::default();
-        let facts = Facts { framework: "Nuxt3".into(), ..Default::default() };
-        let events = vec![ev("turn.ended", "think", 0, vec![], "", "结束", false, false, false)];
+        let facts = Facts {
+            framework: "Nuxt3".into(),
+            ..Default::default()
+        };
+        let events = vec![ev(
+            "turn.ended",
+            "think",
+            0,
+            vec![],
+            "",
+            "结束",
+            false,
+            false,
+            false,
+        )];
         let (v, _) = evaluate(&ctx(events, 0, None, &cd, Some(&facts), &[], &[], 2000));
         match v {
             GateVerdict::Pass(p) => {

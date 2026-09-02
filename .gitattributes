@@ -1,0 +1,3 @@
+# Windows 批处理必须以 CRLF 存交工作区:cmd.exe 按字节流解析,LF-only + 非 ASCII 注释会错位执行
+*.cmd text eol=crlf
+*.bat text eol=crlf
