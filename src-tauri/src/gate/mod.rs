@@ -19,7 +19,7 @@ pub const THEME_COOLDOWN_SECS: i64 = 30 * 60;
 pub const THEME_MUTE_SECS: i64 = 60 * 60;
 pub const DEDUP_WINDOW_SECS: i64 = 60 * 60; // 历史去重窗口(1h)
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Branch {
     Review,
     Knowledge,
@@ -56,7 +56,7 @@ pub enum GateVerdict {
     Reject(GateLevel, String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatePass {
     pub branch: Branch,
     pub score: i32,
@@ -158,24 +158,21 @@ pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
                 s.points.push("新增 API/网络调用(+25)".into());
             }
         }
-        // 异常路径未包裹:diff 里出现 throw/panic/error 且无 catch/try
+        // 异常路径未包裹:文本级检测误报率高(跨语言不可靠),降权至 +15,
+        // 且仅在大变更(≥10 行)时计入——语义级判断交由 G7 LLM 一次完成。
         let err_hint = ex.has_error_path || lower.contains("panic!");
         let has_guard = lower.contains("catch") || lower.contains("try {");
-        if err_hint && !has_guard {
-            s.score += 25;
-            s.points.push("新增异常路径未包 try/catch(+25)".into());
-        }
-        // 注释密度骤降:大变更且 diff 无注释行
-        if ex.line_delta >= 20 && !lower.contains("//") && !lower.contains("///") && !lower.contains("# ") {
+        if err_hint && !has_guard && ex.line_delta >= 10 {
             s.score += 15;
-            s.points.push("注释密度骤降(+15)".into());
+            s.points.push("新增异常路径未见保护(+15)".into());
         }
+        // (评审 R4:移除"注释密度骤降"信号——纯文本无法可靠识别各语言的注释,交由 LLM)
         // TODO/FIXME
         if ex.todo_or_fixme || lower.contains("todo") || lower.contains("fixme") {
             s.score += 15;
             s.points.push("含 TODO/FIXME(+15)".into());
         }
-        // 删除被依赖文件
+        // 删除代码文件:关键词判断不含依赖分析,降权至 +15
         let deleted = lower.contains("删除") || lower.contains("remove ") || lower.contains("rm ");
         let code_file = ex.files.iter().any(|f| {
             [".ts", ".js", ".rs", ".py", ".vue", ".go"]
@@ -183,13 +180,13 @@ pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
                 .any(|ext| f.ends_with(ext))
         });
         if deleted && code_file {
-            s.score += 20;
-            s.points.push("删除被依赖文件(+20)".into());
+            s.score += 15;
+            s.points.push("删除代码文件(+15)".into());
         }
-        // 裸 throw 错误串
+        // 裸 throw 错误串:降权至 +12(语言上下文中的合法用法不少)
         if lower.contains("throw") && !lower.contains("catch") {
-            s.score += 20;
-            s.points.push("裸 throw 错误串(+20)".into());
+            s.score += 12;
+            s.points.push("裸 throw 错误串(+12)".into());
         }
         // 减分:纯格式化/重命名(<5 行)
         let format_only = ex.line_delta < 5
@@ -440,26 +437,6 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
     }
 }
 
-/// 统一去重判定(供 gate_tick "来一道" 等技术入口再使用)
-pub fn dedup_check(
-    branch: Branch,
-    theme: &str,
-    ref_file: &str,
-    pending_cards: &[Card],
-    history: &[Card],
-    now: i64,
-) -> bool {
-    let fp = fingerprint(branch, theme, ref_file);
-    for c in pending_cards.iter().chain(history.iter()) {
-        if (c.status == "pending" || now - c.created_at < DEDUP_WINDOW_SECS)
-            && fingerprint_for_card(c) == fp
-        {
-            return true;
-        }
-    }
-    false
-}
-
 // ---------- Tauri 命令 ----------
 
 /// 手动触发评估("来一道":旁路频控,不破队列上限)
@@ -574,7 +551,7 @@ mod tests {
         }
     }
 
-    /// 高信号夹具:lineDelta≥20 + 网络调用 + 异常路径未包裹 → 80 分,P0
+    /// 高信号夹具:lineDelta≥20(+30) + 网络调用(+25) + 异常未见保护(+15) + 裸 throw(+12) = 82 分,P0
     fn big_write() -> Vec<NormalizedEvent> {
         vec![ev(
             "tool.completed",

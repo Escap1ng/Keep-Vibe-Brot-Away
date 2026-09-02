@@ -53,10 +53,12 @@ pub fn build_event(
     });
     excerpt["files"] = json!(files);
 
+    // 同一时间戳同时用于 id 哈希与最终事件,保证二者一致
+    let ts = now_ms();
     let stub = json!({
         "emitter": emitter,
         "eventType": event_type,
-        "ts": now_ms(),
+        "ts": ts,
         "projectPath": project_path,
         "intent": intent,
     });
@@ -68,7 +70,7 @@ pub fn build_event(
         "emitter": emitter,
         "eventType": event_type,
         "toolName": tool_name,
-        "ts": now_ms(),
+        "ts": ts,
         "projectPath": project_path,
         "sessionId": session_id,
         "excerpt": excerpt,
@@ -78,4 +80,27 @@ pub fn build_event(
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_event_schema_and_fields() {
+        let ev = build_event("test", "tool.completed", "edit", vec!["a.ts"], "+x", "编辑 a.ts", false, false, false, 1, "C:/p", "s1");
+        assert_eq!(ev["schema"], "kvba.event.v1");
+        assert_eq!(ev["emitter"], "test");
+        assert_eq!(ev["projectPath"], "C:/p");
+        assert!(ev["ts"].as_u64().unwrap() > 0);
+        assert!(!ev["id"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_flags_detects_api_and_todo_and_error() {
+        let f = scan_flags("接入 http API", "// TODO: handle throw");
+        assert!(f.has_api_call);
+        assert!(f.todo_or_fixme);
+        assert!(f.has_error_path);
+    }
 }

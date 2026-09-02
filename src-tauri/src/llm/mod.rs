@@ -147,7 +147,7 @@ pub async fn chat_complete(
     let budget_ok = budget::check_then_inc(state);
     if let Err(budget::BudgetErr::Exceeded) = budget_ok {
         budget_toast_once(state);
-        return Err("今日预算已用尽,进入攒批(仅累计信号,不调用 LLM)".into());
+        return Err(format!("{} 今日预算已用尽,进入攒批(仅累计信号,不调用 LLM)", budget::BUDGET_EXCEEDED_PREFIX));
     }
 
     let req = providers::ChatRequest {
@@ -189,40 +189,68 @@ pub async fn chat_complete(
     Err(format!("LLM 调用失败(已重试):{last_err}"))
 }
 
-/// 从 LLM 文本中稳健提取 JSON 契约(找首个 { 到末尾 } 的平衡窗口)
-pub fn parse_contract(text: &str) -> Option<AnalysisOut> {
+/// 从文本中提取首个"括号平衡"的 JSON 对象
+/// (带字符串状态与转义感知;避免贪婪匹配到尾部杂散 `}` 或误吞多个对象)
+pub fn extract_json(text: &str) -> Option<&str> {
     let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
+    let rest = &text[start..];
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, ch) in rest.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+        } else {
+            match ch {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[..i + ch.len_utf8()]);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    let candidate = &text[start..=end];
-    serde_json::from_str::<AnalysisOut>(candidate).ok()
+    None
+}
+
+/// 从 LLM 文本中稳健提取 JSON 契约(平衡括号扫描)
+pub fn parse_contract(text: &str) -> Option<AnalysisOut> {
+    serde_json::from_str(extract_json(text)?).ok()
 }
 
 /// 从 LLM 文本解析 facts 结构(facts 初始生成/合并)
 pub fn parse_contract_facts(text: &str) -> Option<crate::memory::Facts> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str::<crate::memory::Facts>(&text[start..=end]).ok()
+    serde_json::from_str(extract_json(text)?).ok()
 }
 
-/// G7 执行入口:分析门控通过的一次事件批 → 分析卡
+/// G7 执行入口:分析门控通过的一次事件批 → 分析卡(取当前活动项目的上下文)
 pub async fn analyze_pass(state: &Arc<AppState>, pass: &GatePass) -> Result<AnalysisOut, String> {
-    let snapshot = snapshot_for_analysis(state, pass);
+    analyze_pass_for_project(state, pass, "").await
+}
+
+/// G7 执行入口(指定项目版):供攒批消费时使用——攒批项可能在活动项目切换后才被消费
+pub async fn analyze_pass_for_project(state: &Arc<AppState>, pass: &GatePass, project_path: &str) -> Result<AnalysisOut, String> {
+    let snapshot = snapshot_for_analysis(state, pass, project_path);
 
     let system = prompt::system_role();
     let user = prompt::build_analysis_user(&snapshot);
-    // 预算:system 0.6k + user ≤2k → 输出 ≤1k,单次总 ≤5k
+    // 预算:system 0.6k + user ≤3.5k(逐字段裁剪) + 输出 0.8k → 单次总 ≤5k
     let text = chat_complete(state, &system, &user, 800).await?;
 
     if let Some(out) = parse_contract(&text) {
         return Ok(normalize_out(out, pass, &snapshot));
     }
-    // 解析失败:重试一次(更严格提示)
+    // 解析失败:重试一次(更严格提示)。注意:重试会再占一格当日预算。
     let strict = format!("{user}\n\n注意:请只返回一个 JSON 对象,不要包含任何其他文字、不要用 markdown 代码块包裹。");
     let text2 = chat_complete(state, &system, &strict, 800).await?;
     if let Some(out) = parse_contract(&text2) {
@@ -256,8 +284,9 @@ fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot)
     if out.severity.is_empty() {
         out.severity = if p0 { "P0".into() } else { "info".into() };
     }
-    if out.text.chars().count() > 140 {
-        out.text = out.text.chars().take(140).collect();
+    if out.text.chars().count() > 120 {
+        // 契约声明 ≤120 字,截断口径与之一致
+        out.text = out.text.chars().take(120).collect();
     }
     out
 }
@@ -272,7 +301,7 @@ pub struct AnalysisSnapshot {
     pub ref_files: Vec<String>,
 }
 
-fn snapshot_for_analysis(state: &Arc<AppState>, pass: &GatePass) -> AnalysisSnapshot {
+fn snapshot_for_analysis(state: &Arc<AppState>, pass: &GatePass, project_path: &str) -> AnalysisSnapshot {
     let mut snap = AnalysisSnapshot {
         project_path: String::new(),
         facts_text: String::new(),
@@ -282,7 +311,12 @@ fn snapshot_for_analysis(state: &Arc<AppState>, pass: &GatePass) -> AnalysisSnap
         ref_files: vec![],
     };
     let core = state.core.blocking_lock();
-    let key = core.active_project.clone();
+    // 指定项目(攒批消费)优先;空则取当前活动项目
+    let key = if project_path.is_empty() {
+        core.active_project.clone()
+    } else {
+        Some(crate::state::project_key(project_path))
+    };
     let Some(key) = key else { return snap };
     let live = core.projects.get(&key);
     let Some(live) = live else { return snap };
@@ -381,4 +415,46 @@ pub fn budget_toast_once(state: &Arc<AppState>) {
         .title("KVBA 预算已用尽")
         .body("今日 LLM 调用上限已达。进入攒批模式:只累计信号,不调用 LLM。明日自动恢复。")
         .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_contract_with_markdown_fence() {
+        let text = "好的:\n```json\n{\"type\":\"tips\",\"severity\":\"info\",\"theme\":\"vue-lifecycle\",\"text\":\"贴士正文\"}\n```";
+        let out = parse_contract(text).expect("代码块包裹的 JSON 应可解析");
+        assert_eq!(out.theme, "vue-lifecycle");
+    }
+
+    #[test]
+    fn parse_contract_string_with_braces_and_escapes() {
+        // 字符串值内含 } 与转义引号;后面还跟着干扰对象
+        let text = r#"prefix {"text":"a } b \"quoted\""} trailing {"type":"junk"}"#;
+        let out = parse_contract(text).expect("应取首个平衡对象");
+        assert_eq!(out.text, "a } b \"quoted\"");
+        assert!(out.theme.is_empty());
+    }
+
+    #[test]
+    fn parse_contract_rejects_unbalanced() {
+        assert!(parse_contract("{\"text\":\"no close").is_none());
+        assert!(parse_contract("no json at all").is_none());
+    }
+
+    #[test]
+    fn estimate_and_fit_tokens() {
+        let s = "中".repeat(100) + &"a".repeat(400); // ≈ 100 + 100 = 200 token
+        assert!((190..=210).contains(&estimate_tokens(&s)));
+        let fitted = fit_tokens(&s, 50);
+        // 含"…(截断)"后缀,允许小幅超出但必须远小于原文
+        assert!(estimate_tokens(&fitted) <= 60);
+        assert!(estimate_tokens(&fitted) < estimate_tokens(&s));
+    }
+
+    #[test]
+    fn fit_tokens_noop_when_within_budget() {
+        assert_eq!(fit_tokens("短文本", 100), "短文本");
+    }
 }

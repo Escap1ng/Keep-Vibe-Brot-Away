@@ -70,8 +70,9 @@ function nowMs(): number {
   return Date.now();
 }
 
-function blake16(s: string): string {
+function fnv16(s: string): string {
   // 轻量确定性散列(无依赖):Fowler–Noll–Vo 1a 64bit + hex
+  // (仅用于事件 id 去重指纹;主程序不校验哈希算法)
   let h = 0xcbf29ce484222325n;
   for (let i = 0; i < s.length; i++) {
     h ^= BigInt(s.charCodeAt(i));
@@ -119,7 +120,18 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
   // before 阶段捕获 args(edit/write 的内容在 after 阶段也能取到,这里主要用于命令/文件)
   const lastArgs = new Map<string, unknown>();
 
-  const endpoint = readEndpoint();
+  // 端点惰性重读:插件加载时 KVBA 可能尚未启动;此后每 ≥30s 重试一次,避免整会话静默失效
+  let endpoint: Endpoint | null = readEndpoint();
+  let lastEndpointAttempt = Date.now();
+  function ensureEndpoint(): Endpoint | null {
+    if (endpoint) return endpoint;
+    const now = Date.now();
+    if (now - lastEndpointAttempt < 30_000) return null;
+    lastEndpointAttempt = now;
+    endpoint = readEndpoint();
+    return endpoint;
+  }
+
   await client.app.log({
     body: {
       service: "kvba-plugin",
@@ -143,7 +155,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
     todo: boolean,
     lineDelta: number,
   ) {
-    if (!endpoint) return;
+    if (!ensureEndpoint()) return;
     const excerpt = {
       files,
       diffHead: diffHead.slice(0, 6000),
@@ -153,9 +165,9 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
       todoOrFixme: todo,
       lineDelta,
     };
-    void postEvent(endpoint, {
+    void postEvent(endpoint!, {
       schema: SCHEMA,
-      id: blake16(`${eventType}|${tool}|${nowMs()}|${intent.slice(0, 40)}`),
+      id: fnv16(`${eventType}|${tool}|${nowMs()}|${intent.slice(0, 40)}`),
       emitter: "opencode-plugin",
       eventType,
       toolName: tool,
@@ -168,11 +180,11 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
 
   return {
     "tool.execute.before": async (input, output) => {
-      if (!endpoint) return;
+      if (!ensureEndpoint()) return;
       lastArgs.set(input.tool, output?.args ?? null);
     },
     "tool.execute.after": async (input, output) => {
-      if (!endpoint) return;
+      if (!ensureEndpoint()) return;
       const tool = input.tool;
       const args = output?.args ?? lastArgs.get(tool);
       const files = extractFiles(args as Record<string, unknown>);
@@ -190,7 +202,8 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
             : `执行 ${tool}`;
 
       const flags = scanFlags(intent + " " + src);
-      const lineDelta = (diff || content).split("\n").length;
+      // 空内容不计行数(避免 "".split("\n") 得出虚高 1)
+      const lineDelta = diff || content ? (diff || content).split("\n").length : 0;
       emit("tool.completed", tool, files, diff || content.slice(0, 6000), intent, flags.hasErrorPath, flags.hasApiCall, flags.todoOrFixme, tool === "bash" ? 0 : lineDelta);
 
       // opencode 的 bash 输出错误(excerpt 摘录)
@@ -202,7 +215,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
       }
     },
     event: async ({ event }) => {
-      if (!endpoint) return;
+      if (!ensureEndpoint()) return;
       if (event.type === "session.idle") {
         emit("turn.ended", "", [], "", "本轮处理结束", false, false, false, 0);
       }

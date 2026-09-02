@@ -1,4 +1,4 @@
-﻿//! 本地 HTTP 端点(127.0.0.1 随机端口 + 随机 token 鉴权):
+//! 本地 HTTP 端点(127.0.0.1 随机端口 + 随机 token 鉴权):
 //! - POST /kvba/hello:适配器用主 token 换取事件上报 token
 //! - POST /kvba/events:事件上报(header X-KVBA-Token: eventToken)
 //! 端点信息写入 <dataDir>/endpoint.json 供适配器读取。
@@ -194,53 +194,65 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         snapshot.queue_len,
         matches!(verdict, crate::gate::GateVerdict::Pass(_))
     );
-    // 阶段 2:决策日志(同步作用域)
-    {
-        let mut core = state.core.blocking_lock();
-        let entry = crate::gate::DecisionEntry {
-            ts: crate::state::now_ts(),
-            level: match &verdict {
-                crate::gate::GateVerdict::Pass(_) => "G7".into(),
-                crate::gate::GateVerdict::Reject(l, _) => l.as_str().into(),
-            },
-            pass: matches!(verdict, crate::gate::GateVerdict::Pass(_)),
-            reason: match &verdict {
-                crate::gate::GateVerdict::Pass(p) => p.reason.clone(),
-                crate::gate::GateVerdict::Reject(_, r) => r.clone(),
-            },
-            branch: match &verdict {
-                crate::gate::GateVerdict::Pass(p) => Some(format!("{:?}", p.branch)),
-                _ => None,
-            },
-            score: Some(scoring.score),
-            elapsed_ms: elapsed,
-            project: snapshot.project_path.clone(),
-        };
-        core.decision_log.push_back(entry.clone());
-        while core.decision_log.len() > 200 {
-            core.decision_log.pop_front();
-        }
-        crate::state::save_core_locked(&state.data_dir, &core);
-        crate::state::emit(&state.app, "decision.new", &entry);
-    }
 
+    // 阶段 2:门控拒绝 → 立即记录;通过 → 待 G7 真实结局后记录(日志与结果一致)
     let pass = match verdict {
         crate::gate::GateVerdict::Pass(p) => p,
         crate::gate::GateVerdict::Reject(level, reason) => {
             log::debug!("门控拒绝 {}:{}", level.as_str(), reason);
+            log_decision(
+                &state,
+                &snapshot.project_path,
+                level.as_str(),
+                false,
+                &reason,
+                None,
+                Some(scoring.score),
+                elapsed,
+            );
             return PipelineOutcome::Rejected(level.as_str().into(), reason);
         }
     };
 
-    // G7 执行:仅此处调用 LLM(单次 ≤5k)。未配置 → 模板卡降级;预算超限 → 攒批(不调用)
+    // G7 执行:仅此处调用 LLM(单次 ≤5k)。未配置 → 模板卡降级;预算超限 → 攒批(暂存待补发)
     let analysis = if crate::llm::is_configured(&state) {
         match crate::llm::analyze_pass(&state, &pass).await {
             Ok(out) => Some(out),
             Err(e) => {
                 log::warn!("LLM 分析失败:{e}");
+                let is_budget = e.starts_with(crate::llm::budget::BUDGET_EXCEEDED_PREFIX);
+                if is_budget {
+                    // 攒批:保存门控通过快照,额度恢复后由维护任务补发分析
+                    let mut core = state.core.blocking_lock();
+                    crate::llm::budget::push_batch(
+                        &mut core,
+                        crate::state::BatchItem {
+                            pass: pass.clone(),
+                            project_path: snapshot.project_path.clone(),
+                            ref_event_id: snapshot.last_event_id.clone(),
+                            created_at: crate::state::now_ts(),
+                        },
+                    );
+                    crate::state::save_core_locked(&state.data_dir, &core);
+                    drop(core);
+                }
+                log_decision(
+                    &state,
+                    &snapshot.project_path,
+                    "G7",
+                    false,
+                    if is_budget {
+                        "预算耗尽 → 已攒批,额度恢复后补发"
+                    } else {
+                        "LLM 分析失败"
+                    },
+                    Some(&pass.branch),
+                    Some(scoring.score),
+                    elapsed,
+                );
                 return PipelineOutcome::Rejected(
                     "G7".to_string(),
-                    format!("LLM 分析失败:{e}"),
+                    if is_budget { "已攒批(今日预算耗尽)".into() } else { e },
                 );
             }
         }
@@ -255,6 +267,16 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         analysis.unwrap(),
         snapshot.last_event_id,
     );
+    log_decision(
+        &state,
+        &snapshot.project_path,
+        "G7",
+        inserted,
+        if inserted { "卡片生成并入队" } else { "入队被拒(队列已满或同指纹重复)" },
+        Some(&pass.branch),
+        Some(scoring.score),
+        elapsed,
+    );
     if inserted {
         PipelineOutcome::CardCreated
     } else {
@@ -263,4 +285,51 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
             "队列已满或同主题重复,卡片未入队".into(),
         )
     }
+}
+
+/// 写一条决策日志:内存滚动 + JSONL 单行追加(超阈值才整写修剪),
+/// 不再走 save_core_locked 全量重写五个文件,消除"每事件一次全量落盘"的写放大。
+fn log_decision(
+    state: &Arc<AppState>,
+    project: &str,
+    level: &str,
+    pass: bool,
+    reason: &str,
+    branch: Option<&crate::gate::Branch>,
+    score: Option<i32>,
+    elapsed_ms: u64,
+) {
+    let entry = crate::gate::DecisionEntry {
+        ts: crate::state::now_ts(),
+        level: level.into(),
+        pass,
+        reason: reason.into(),
+        branch: branch.map(|b| format!("{b:?}")),
+        score,
+        elapsed_ms,
+        project: project.into(),
+    };
+    {
+        let mut core = state.core.blocking_lock();
+        core.decision_log.push_back(entry.clone());
+        while core.decision_log.len() > 200 {
+            core.decision_log.pop_front();
+        }
+    }
+    if let Ok(line) = serde_json::to_string(&entry) {
+        use std::io::Write;
+        let path = state.data_dir.join("decision-log.jsonl");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+        // 滚动修剪:超过 400 行时仅保留最近 200 行
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let n = raw.lines().count();
+            if n > 400 {
+                let keep: String = raw.lines().skip(n - 200).map(|x| format!("{x}\n")).collect();
+                let _ = std::fs::write(&path, keep);
+            }
+        }
+    }
+    crate::state::emit(&state.app, "decision.new", &entry);
 }

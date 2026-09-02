@@ -99,7 +99,12 @@ fn main() {
             "",
             vec![],
             "",
-            &hook["stop_hook_active"].as_str().unwrap_or("").to_string(),
+            // stop_hook_active 是布尔;给出稳定 intent 便于门控与去重
+            if hook["stop_hook_active"].as_bool().unwrap_or(false) {
+                "回合结束(停止钩子应答)"
+            } else {
+                "回合结束"
+            },
             false,
             false,
             false,

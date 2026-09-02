@@ -169,14 +169,11 @@ pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str
                 .iter()
                 .find(|c| c.status == "pending")
                 .cloned();
-            if let Some(old_card) = oldest {
-                for c in core.queue.iter_mut() {
-                    if c.id == old_card.id {
-                        c.status = "dismissed".into();
-                        break;
-                    }
-                }
+            if let Some(mut old_card) = oldest {
+                old_card.status = "dismissed".into();
                 emit("card.dismissed", &old_card);
+                // 被替换的卡同样归档进历史,避免只改状态留在队列、重启后静默丢失
+                archive_card(core, old_card);
             }
         } else {
             return None;
@@ -185,21 +182,27 @@ pub fn insert_card(core: &mut crate::state::Core, card: Card, emit: &dyn Fn(&str
 
     // 主题冷却记录
     core.cooldowns.touch_asked(&card.theme, now_ts());
-    // 近期提问指纹(10 分钟窗口)
-    core.recently_asked.push_back((now_ts(), fp));
-    while let Some((t, _)) = core.recently_asked.front() {
-        if now_ts() - *t > 600 {
-            core.recently_asked.pop_front();
-        } else {
-            break;
-        }
-    }
-
     core.last_card_at = Some(now_ts());
+    core.stats.roll_to_today();
     core.stats.cards_created += 1;
     core.queue.push_back(card.clone());
     emit("card.new", &card);
     Some(card)
+}
+
+/// 归档已退场的卡片:移出队列并计入历史(上限 500,丢最旧)
+pub fn archive_card(core: &mut crate::state::Core, card: Card) {
+    core.queue.retain(|c| c.id != card.id);
+    core.history.push(card);
+    if core.history.len() > 500 {
+        let overflow = core.history.len() - 500;
+        core.history.drain(0..overflow);
+    }
+}
+
+/// 归一化文件路径用于比对:统一分隔符并转小写(Windows 大小写不敏感)
+fn norm_path(p: &str) -> String {
+    p.replace('\\', "/").to_lowercase()
 }
 
 /// 持久化:queue.json 仅存 pending 卡(历史单独存 history.json),避免混存翻倍
@@ -229,16 +232,22 @@ pub fn spawn_maintenance(handle: &tauri::AppHandle) {
             let now = now_ts();
             {
                 let mut core = state_arc.core.blocking_lock();
-                // TTL 过期
-                for c in core.queue.iter_mut() {
-                    if c.status == "pending" && now - c.created_at > TTL_SECS {
-                        c.status = "dismissed".into();
-                        changed = true;
-                        let card = c.clone();
-                        crate::state::emit(&app, "card.dismissed", &card);
-                    }
+                // TTL 过期 → dismissed 并归档进历史(避免重启后静默丢失、历史不可见)
+                let expired: Vec<Card> = core
+                    .queue
+                    .iter()
+                    .filter(|c| c.status == "pending" && now - c.created_at > TTL_SECS)
+                    .cloned()
+                    .collect();
+                for mut card in expired {
+                    card.status = "dismissed".into();
+                    changed = true;
+                    crate::state::emit(&app, "card.dismissed", &card);
+                    archive_card(&mut core, card);
                 }
-                // 引用文件被再次修改 → 已过时
+                // 引用文件被"再次"修改 → 已过时。
+                // 仅统计卡片创建之后到达的事件(生成卡片的事件本身不算"再次修改");
+                // 路径用归一化精确比对,不用后缀匹配(避免误判同名尾缀的不同文件)。
                 let stale_cards: Vec<_> = core
                     .queue
                     .iter()
@@ -250,10 +259,11 @@ pub fn spawn_maintenance(handle: &tauri::AppHandle) {
                             .get(&key)
                             .map(|p| {
                                 p.events.iter().rev().take(30).any(|e| {
-                                    e.excerpt
-                                        .files
-                                        .iter()
-                                        .any(|f| c.ref_files.iter().any(|r| r == f || f.ends_with(r)))
+                                    e.ts > c.created_at
+                                        && e.excerpt.files.iter().any(|f| {
+                                            let nf = norm_path(f);
+                                            c.ref_files.iter().any(|r| norm_path(r) == nf)
+                                        })
                                 })
                             })
                             .unwrap_or(false);
@@ -262,20 +272,17 @@ pub fn spawn_maintenance(handle: &tauri::AppHandle) {
                     .filter(|(_, touched)| *touched)
                     .collect();
                 for (mut card, _) in stale_cards {
-                    for c in core.queue.iter_mut() {
-                        if c.id == card.id {
-                            c.status = "stale".into();
-                            break;
-                        }
-                    }
                     card.status = "stale".into();
                     changed = true;
                     crate::state::emit(&app, "card.updated", &card);
+                    archive_card(&mut core, card);
                 }
                 if changed {
                     crate::state::save_core_locked(&state_arc.data_dir, &core);
                 }
             }
+            // 攒批消费:额度恢复且未撞频控/队列上限时,补发一条暂存的门控通过项
+            crate::llm::budget::try_drain_batch(&state_arc);
         }
     });
 }
@@ -307,8 +314,7 @@ fn set_status_and_finish(
     };
 
     let mut core = state.core.blocking_lock();
-    // 已消费的卡移出队列(只保留在历史中),防止队列混存与重复加载
-    core.queue.retain(|c| c.id != card.id);
+    core.stats.roll_to_today();
     core.stats.answers += 1;
     if answer.contains("不满意") {
         core.stats.unsatisfied += 1;
@@ -340,17 +346,11 @@ fn set_status_and_finish(
             live.consumed_since_merge = 0;
             let pdir = state_dir(&state, &card.project_path);
             let facts = live.facts.clone();
-            drop_facts_kick(state, pdir, facts);
+            drop_facts_kick(state, pdir, facts, card.project_path.clone());
         }
     }
-    // 入历史(上限 500)
-    core.history.push(card.clone());
-    let end_keep: Vec<Card> = {
-        let mut kept: Vec<Card> = core.history.iter().rev().take(500).cloned().collect();
-        kept.reverse();
-        kept
-    };
-    core.history = end_keep;
+    // 移出队列并入历史(上限 500,丢最旧)
+    archive_card(&mut core, card.clone());
     crate::state::save_core_locked(&state.data_dir, &core);
     drop(core);
 
@@ -363,11 +363,11 @@ fn state_dir(state: &Arc<AppState>, project_path: &str) -> Option<PathBuf> {
     Some(state.project_dir(project_path))
 }
 
-fn drop_facts_kick(state: &Arc<AppState>, pdir: Option<PathBuf>, facts: Option<crate::memory::Facts>) {
+fn drop_facts_kick(state: &Arc<AppState>, pdir: Option<PathBuf>, facts: Option<crate::memory::Facts>, project_path: String) {
     // 异步增量精炼(由 memory::merge_kick 完成;避免死锁:加载后脱离锁执行)
     let state = state.clone();
     let Some((pdir, facts)) = pdir.zip(facts) else { return };
-    crate::memory::merge_kick(state, pdir, facts);
+    crate::memory::merge_kick(state, pdir, facts, project_path);
 }
 
 #[tauri::command]
@@ -498,4 +498,115 @@ pub fn push_pass_card(app: &tauri::AppHandle, state: &Arc<AppState>, pass: &Gate
         crate::windows::show_panel(app);
     }
     inserted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+    use crate::state::Core;
+
+    fn mk_card(theme: &str, kind: &str, severity: &str, ref_file: &str) -> Card {
+        Card {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: kind.into(),
+            severity: severity.into(),
+            text: "?".into(),
+            options: PENDING_OPTIONS.iter().map(|s| s.to_string()).collect(),
+            theme: theme.into(),
+            ref_files: vec![ref_file.to_string()],
+            ref_event_id: String::new(),
+            created_at: now_ts(),
+            status: "pending".into(),
+            answer: String::new(),
+            optimized_prompt: String::new(),
+            project_path: "C:/proj/foo".into(),
+        }
+    }
+
+    fn noop_emit() -> impl Fn(&str, &Card) {
+        |_, _| {}
+    }
+
+    #[test]
+    fn cooldown_two_unsatisfied_mutes_theme_for_1h() {
+        let mut cd = CooldownMap::default();
+        cd.note_answer("vue-lifecycle", true, 1000);
+        assert!(!cd.is_muted("vue-lifecycle", 1000), "1 次不满意不应静默");
+        cd.note_answer("vue-lifecycle", true, 1100);
+        assert!(cd.is_muted("vue-lifecycle", 1100), "连续 2 次不满意应静默 1h");
+        assert!(cd.is_muted("vue-lifecycle", 1100 + crate::gate::THEME_MUTE_SECS - 1));
+        assert!(!cd.is_muted("vue-lifecycle", 1100 + crate::gate::THEME_MUTE_SECS + 1));
+    }
+
+    #[test]
+    fn cooldown_satisfied_answer_resets_streak() {
+        let mut cd = CooldownMap::default();
+        cd.note_answer("t", true, 1000);
+        cd.note_answer("t", false, 1100); // 满意 → 清零
+        cd.note_answer("t", true, 1200);
+        assert!(!cd.is_muted("t", 1200), "中断后的单次不满意不应触发静默");
+    }
+
+    #[test]
+    fn insert_card_respects_queue_cap_and_default_discards() {
+        let mut core = Core::empty(Settings::default());
+        for i in 0..3 {
+            assert!(insert_card(&mut core, mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")), &noop_emit()).is_some());
+        }
+        assert_eq!(core.queue.iter().filter(|c| c.status == "pending").count(), 3);
+        // 队列满:默认配置下直接丢弃
+        assert!(insert_card(&mut core, mk_card("t3", "tips", "info", "f3.ts"), &noop_emit()).is_none());
+        assert_eq!(core.queue.len(), 3);
+    }
+
+    #[test]
+    fn insert_card_p0_replaces_oldest_when_allowed_and_archives() {
+        let mut core = Core::empty(Settings { p0_replace_queue: true, ..Default::default() });
+        for i in 0..3 {
+            insert_card(&mut core, mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")), &noop_emit());
+        }
+        let before_history = core.history.len();
+        let r = insert_card(&mut core, mk_card("code-review", "review", "P0", "fx.ts"), &noop_emit());
+        assert!(r.is_some(), "P0 允许替换时应入队");
+        assert_eq!(core.queue.iter().filter(|c| c.status == "pending").count(), 3, "总数仍 ≤3");
+        // 被替换的卡归档进历史而不是留在队列里等重启丢失
+        assert_eq!(core.history.len(), before_history + 1);
+        assert!(core.history.iter().any(|c| c.status == "dismissed"));
+        assert_eq!(core.queue.iter().filter(|c| c.status != "pending").count(), 0);
+    }
+
+    #[test]
+    fn insert_card_rejects_duplicate_fingerprint() {
+        let mut core = Core::empty(Settings::default());
+        let c1 = mk_card("vue-lifecycle", "tips", "info", "a.ts");
+        assert!(insert_card(&mut core, c1.clone(), &noop_emit()).is_some());
+        // 同主题同引用文件 → 同指纹,id 却不同;竞态护栏应拒绝
+        let c2 = mk_card("vue-lifecycle", "tips", "info", "a.ts");
+        assert_ne!(c1.id, c2.id);
+        assert!(insert_card(&mut core, c2, &noop_emit()).is_none());
+    }
+
+    #[test]
+    fn archive_card_moves_out_of_queue_and_caps_history_at_500() {
+        let mut core = Core::empty(Settings::default());
+        let c = mk_card("t", "tips", "info", "f.ts");
+        core.queue.push_back(c.clone());
+        archive_card(&mut core, c);
+        assert!(core.queue.is_empty());
+        assert_eq!(core.history.len(), 1);
+        // 灌满 600 张 → 上限 500,丢最旧
+        for i in 0..600 {
+            let c = mk_card(&format!("tt{i}"), "tips", "info", &format!("x{i}.ts"));
+            archive_card(&mut core, c);
+        }
+        assert_eq!(core.history.len(), 500);
+        assert!(core.history.first().unwrap().theme != "tt0", "最旧的应被丢弃");
+    }
+
+    #[test]
+    fn norm_path_unifies_separators_and_case() {
+        assert_eq!(norm_path("C:\\Proj\\SRC\\App.vue"), norm_path("c:/proj/src/app.VUE"));
+        assert_ne!(norm_path("src/app.vue"), norm_path("other/src/app.vue"));
+    }
 }
