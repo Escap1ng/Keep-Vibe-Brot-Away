@@ -35,6 +35,7 @@ npm run tauri dev  # 或直接双击 dev.cmd
 
 ```bash
 npm run tauri build   # 产物: src-tauri/target/release/bundle/nsis/*.exe
+# 只想要 nsis 安装包(跳过 msi): npm run tauri build -- --bundles nsis
 ```
 
 安装后从开始菜单启动「KVBA」。启动即后台驻留:系统托盘图标 + 屏幕右缘的红色悬浮胶囊,**不弹任何主窗口**;勾选设置里的「开机自启」后随系统静默启动。退出只能走托盘菜单(窗口 ✕ 一律转为隐藏)。
@@ -141,7 +142,7 @@ Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
 └────────────────────────────────────────────────────────────┘
 ```
 
-- **门控决策树**(`src-tauri/src/gate/`):G1 队列硬闸 → G2 频控/主题冷却 → G3 活性 → G4 分支路由 → G5 信号评分(阈值 60,P0 判定)→ G6 去重 → G7 才允许调用 LLM(单次 ≤5k token)。全部 0 token、纯函数、带 14 项夹具单测。面板内「决策日志」可看每次评估:Gx 层级、拒绝原因、耗时。
+- **门控决策树**(`src-tauri/src/gate/`):G1 队列硬闸 → G2 频控/主题冷却 → G3 活性 → G4 分支路由 → G5 信号评分(阈值 60,P0 判定)→ G6 去重 → G7 才允许调用 LLM(单次 ≤5k token)。全部 0 token、纯函数、带 16 项夹具单测。面板内「决策日志」可看每次评估:Gx 层级、拒绝原因、耗时。
 - **记忆层**(`src-tauri/src/memory/`):项目级 facts(扫描 package.json/README/目录树,首版一次 LLM 生成,增量合并仅在消费 ≥20 或会话结束时)+ 对话滚动窗口(最近 3 条 ≤3KB,零 LLM)。
 - **加密存储**(`src-tauri/src/crypto/`):AES-256-GCM,密钥 = HKDF-SHA256(机器指纹,随机 salt);机器指纹:Windows MachineGuid / macOS IOPlatformUUID / Linux /etc/machine-id。不出现 MD5。
 - **防腐拒侵入**:适配器失败重试 3 次后丢弃,永不阻塞 Agent;胶囊 idle 态整窗点击穿透(悬停探测器条恢复交互);置顶从不抢焦点;胶囊可随时隐藏退化为托盘 + 系统通知兜底。
@@ -171,6 +172,20 @@ adapters/
   opencode-plugin/    TS 插件(kvba-plugin.ts)
 docs/                 规格与文档
 ```
+
+## 持续集成与发布
+
+- **CI**(`.github/workflows/ci.yml`,每次 push / PR / 三平台矩阵):
+  `vue-tsc + vite build` → opencode 插件 `tsc --noEmit`(并校验 `.opencode/plugins/` 副本与源文件一致)→
+  `cargo test --locked`(主程序 + claude-code 适配器)。
+  `cargo fmt --check` 与 `cargo clippy` 现阶段**只写进任务摘要、不阻断合并**;存量 clippy 警告清零后可改为 `-D warnings` 门禁。
+- **发布**(`.github/workflows/release.yml`):打 tag 即三平台打包并把产物挂到 GitHub Release。
+
+  ```bash
+  git tag v0.1.0 && git push origin v0.1.0
+  ```
+
+  产物:Windows `nsis/*.exe`、Ubuntu `deb/*.deb`、macOS `dmg/*.dmg`。tag 去前缀后与 `package.json` 版本不一致会直接失败;手动触发(workflow_dispatch)只构建上传工作流产物,不建 Release。
 
 ## 已知边界
 
