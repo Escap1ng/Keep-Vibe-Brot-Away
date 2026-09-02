@@ -21,6 +21,8 @@ fn main() {
     let projects_dir = PathBuf::from(&claude_dir).join("projects");
     // 每文件独立偏移:path → offset
     let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
+    // 每文件项目路径缓存:path → cwd(取自转录行的 cwd 字段)
+    let mut cwd_cache: HashMap<PathBuf, String> = HashMap::new();
 
     loop {
         if let Ok(entries) = fs::read_dir(&projects_dir) {
@@ -32,7 +34,7 @@ fn main() {
                     for f in files.flatten() {
                         let p = f.path();
                         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                            tail_file(&p, &mut offsets);
+                            tail_file(&p, &mut offsets, &mut cwd_cache);
                         }
                     }
                 }
@@ -42,7 +44,7 @@ fn main() {
     }
 }
 
-fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>) {
+fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>, cwd_cache: &mut HashMap<PathBuf, String>) {
     let Ok(meta) = fs::metadata(path) else { return };
     let len = meta.len();
     let offset = offsets.entry(path.to_path_buf()).or_insert(0);
@@ -61,15 +63,22 @@ fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>) {
     }
     let mut line = String::new();
     let mut consumed: u64 = 0;
+    let mut lines: u32 = 0;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(n) => {
+                // 半行保护:文件正在被写入、行尾尚无换行符时不提交偏移,
+                // 等待下次轮询该行补全后再读,避免残行被永久跳过。
+                if !line.ends_with('\n') {
+                    break;
+                }
                 consumed += n as u64;
-                handle_line(&line, path);
-                // 安全阀:单次最多 200 条
-                if consumed > 1_000_000 {
+                lines += 1;
+                handle_line(&line, path, cwd_cache);
+                // 安全阀:单次最多 200 条(或 1MB)
+                if lines >= 200 || consumed > 1_000_000 {
                     break;
                 }
             }
@@ -79,16 +88,22 @@ fn tail_file(path: &Path, offsets: &mut HashMap<PathBuf, u64>) {
     *offset += consumed;
 }
 
-fn handle_line(line: &str, jsonl_path: &Path) {
+fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, String>) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
     let Some(msg) = v["message"].as_object() else { return };
     let session_id = v["sessionId"].as_str().unwrap_or("").to_string();
-    // 项目路径:从目录名与 transcript_path 推导
-    let cwd = jsonl_path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // 项目路径:转录行自带 cwd 字段(权威来源);缺失时用本文件已缓存的 cwd;
+    // 两者都没有则放弃该事件,绝不猜测路径(避免把事件归错项目)。
+    let cwd = match v["cwd"].as_str() {
+        Some(c) if !c.is_empty() => {
+            cwd_cache.insert(jsonl_path.to_path_buf(), c.to_string());
+            c.to_string()
+        }
+        _ => cwd_cache.get(jsonl_path).cloned().unwrap_or_default(),
+    };
+    if cwd.is_empty() {
+        return;
+    }
 
     let Some(content) = msg["content"].as_array() else { return };
     for part in content {

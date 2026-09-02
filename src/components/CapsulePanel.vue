@@ -152,7 +152,6 @@ onMounted(async () => {
     await listen("prompt.generated", () => {
       // 提示词已入剪贴板
     }),
-    await listen("capsule:panel-head", () => void 0),
   );
 
   // 失焦自动收起(仅在面板曾获得焦点时可靠;未交互时由 ✕/ESC 兜底)

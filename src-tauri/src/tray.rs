@@ -45,8 +45,13 @@ pub fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
                 let mut core = state.core.blocking_lock();
                 core.settings.paused = !core.settings.paused;
                 core.paused = core.settings.paused;
+                let paused = core.settings.paused;
                 let _ = crate::settings::save_settings(&state.data_dir, &core.settings);
                 drop(core);
+                // 菜单文案随状态翻转
+                if let Some(item) = MenuItem::with_id(app, "tray-pause", "", true, None::<&str>).ok() {
+                    let _ = item.set_text(if paused { "恢复提问" } else { "暂停提问" });
+                }
             }
             "tray-settings" => crate::windows::open_settings(app),
             "tray-exit" => app.exit(0),

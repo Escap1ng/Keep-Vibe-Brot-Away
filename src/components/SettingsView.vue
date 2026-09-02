@@ -201,7 +201,8 @@ onMounted(async () => {
           <span v-else class="warn">尚未收到事件——请重启 opencode 会话以加载插件</span>
         </div>
         <div class="row static"><span>活动项目</span><code class="proj">{{ stats?.activeProject || "—" }}</code></div>
-        <div class="row static"><span>累计</span><span>发卡 {{ stats?.cardsCreated ?? 0 }} · 回答 {{ stats?.answers ?? 0 }} · 不满意 {{ stats?.unsatisfied ?? 0 }}</span></div>
+        <div class="row static"><span>今日</span><span>发卡 {{ stats?.cardsCreated ?? 0 }} · 回答 {{ stats?.answers ?? 0 }} · 不满意 {{ stats?.unsatisfied ?? 0 }}<template v-if="(stats?.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.todayAnswerRate) }}%</template></span></div>
+        <div class="row static"><span>累计</span><span>发卡 {{ stats?.total.cardsCreated ?? 0 }} · 回答 {{ stats?.total.answers ?? 0 }} · 不满意 {{ stats?.total.unsatisfied ?? 0 }}<template v-if="(stats?.total.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.total.answerRate) }}%</template><template v-if="(stats?.batched ?? 0) > 0"> · 攒批待发 {{ stats!.batched }}</template></span></div>
         <div class="row static"><span>框架事实</span><span>{{ facts?.framework || "未生成(Agent 有动作后自动生成)" }}</span></div>
       </fieldset>
 

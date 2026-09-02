@@ -31,6 +31,14 @@ export const api = {
       cardsCreated: number;
       answers: number;
       unsatisfied: number;
+      todayAnswerRate: number;
+      total: {
+        cardsCreated: number;
+        answers: number;
+        unsatisfied: number;
+        answerRate: number;
+      };
+      batched: number;
     }>("stats_info"),
   secretsPut: (provider: string, key: string) =>
     invoke<void>("secrets_put", { provider, key }),
