@@ -117,7 +117,7 @@ function extractFiles(args: Record<string, unknown> | undefined): string[] {
 }
 
 export const KvbaPlugin: Plugin = async ({ directory, client }) => {
-  // before 阶段捕获 args(edit/write 的内容在 after 阶段也能取到,这里主要用于命令/文件)
+  // after 钩子的 input.args 即本次调用的参数;此表仅作兜底(部分版本 before 才带 args)
   const lastArgs = new Map<string, unknown>();
 
   // 端点惰性重读:插件加载时 KVBA 可能尚未启动;此后每 ≥30s 重试一次,避免整会话静默失效
@@ -186,7 +186,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
     "tool.execute.after": async (input, output) => {
       if (!ensureEndpoint()) return;
       const tool = input.tool;
-      const args = output?.args ?? lastArgs.get(tool);
+      const args = input.args ?? lastArgs.get(tool);
       const files = extractFiles(args as Record<string, unknown>);
       const command = pickContent(args as Record<string, unknown>, ["command", "commandText"]);
       const content = pickContent(args as Record<string, unknown>, ["content", "option"]);
@@ -208,7 +208,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
 
       // opencode 的 bash 输出错误(excerpt 摘录)
       if (tool === "bash") {
-        const resText = JSON.stringify(output?.parts ?? output ?? "").slice(0, 6000);
+        const resText = String(output.output ?? "").slice(0, 6000);
         if (/error|failed|exception|panic/i.test(resText)) {
           emit("tool.completed", "bash", files, resText, `${intent} [输出含错误]`, true, flags.hasApiCall, false, 0);
         }

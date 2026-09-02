@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  NODE_VERSION: "20"
+
+jobs:
+  # 前端:vue-tsc 类型检查 + vite 构建;顺带守住 opencode 插件副本同步
+  frontend:
+    name: 前端 (vue-tsc + vite build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: opencode 插件副本必须与源文件一致
+        run: cmp adapters/opencode-plugin/kvba-plugin.ts .opencode/plugins/kvba-plugin.ts
+
+      - name: 类型检查与构建
+        run: npm run build
+
+  # opencode 插件是独立于前端的 TS 产物,单独给出信号
+  opencode-plugin:
+    name: opencode 插件类型检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 安装类型依赖
+        run: npm install --no-save --no-audit --no-fund typescript@5.7.3 @types/node@22 "@opencode-ai/plugin@^1"
+
+      - name: tsc --noEmit
+        run: >
+          npx tsc --noEmit --strict --skipLibCheck
+          --target es2022 --module esnext --moduleResolution bundler
+          --types node adapters/opencode-plugin/kvba-plugin.ts
+
+  # Rust:主程序 + claude-code 适配器,三平台
+  rust:
+    name: Rust (核心 + 适配器 / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux 系统依赖 (Tauri)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libssl-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            build-essential curl wget file patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+            adapters/claude-code
+
+      - name: cargo fmt --check (仅提示)
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+        continue-on-error: true
+
+      - name: clippy — 主程序 (仅报告)
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          cargo clippy --all-targets --locked --message-format=short 2>&1 \
+            | tee "$RUNNER_TEMP/clippy-core.txt"
+          exit 0
+        continue-on-error: true
+
+      - name: 单元测试 — 主程序
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: clippy — claude-code 适配器 (仅报告)
+        working-directory: adapters/claude-code
+        shell: bash
+        run: |
+          cargo clippy --all-targets --locked --message-format=short 2>&1 \
+            | tee "$RUNNER_TEMP/clippy-adapter.txt"
+          exit 0
+        continue-on-error: true
+
+      - name: 单元测试 — claude-code 适配器
+        working-directory: adapters/claude-code
+        run: cargo test --locked
+
+      - name: Lint 汇总 (写入任务摘要)
+        if: always()
+        shell: bash
+        run: |
+          count() {
+            local f="$1"
+            [ -f "$f" ] || { echo 0; return; }
+            awk '/warning:/ && !/generated/' "$f" | wc -l | tr -d ' '
+          }
+          core=$(count "$RUNNER_TEMP/clippy-core.txt") || core=0
+          adapter=$(count "$RUNNER_TEMP/clippy-adapter.txt") || adapter=0
+          {
+            echo "## clippy 报告 (${{ matrix.os }})"
+            echo ""
+            echo "| 目标 | 警告数 |"
+            echo "|---|---|"
+            echo "| src-tauri | ${core:-0} |"
+            echo "| adapters/claude-code | ${adapter:-0} |"
+            echo ""
+            echo "> 当前为基线报告,不阻断合并;清零后可改为 \`-D warnings\` 门禁。"
+          } >> "$GITHUB_STEP_SUMMARY"
