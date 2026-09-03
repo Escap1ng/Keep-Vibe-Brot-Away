@@ -13,11 +13,17 @@ use crate::events::NormalizedEvent;
 use crate::memory::Facts;
 use crate::queue::Card;
 
-pub const SCORE_THRESHOLD: i32 = 60;
-pub const LAST_CARD_WINDOW_SECS: i64 = 60;
-pub const THEME_COOLDOWN_SECS: i64 = 30 * 60;
+/// G5-A 审查阈值。60 时一次 8 行的普通重构恒为 0 分,整批信号被白白丢掉;
+/// 实测(2026-09-03)读 4 个 .md 就能把分数压到 -100,阈值越高越埋没真实写信号。
+pub const SCORE_THRESHOLD: i32 = 40;
+/// G2 频控:距上次弹卡的最小间隔
+pub const LAST_CARD_WINDOW_SECS: i64 = 25;
+/// G2 同主题冷却(轮换后仍有兜底作用)
+pub const THEME_COOLDOWN_SECS: i64 = 10 * 60;
+/// 用户明确"不再问这类"/连续 2 次不满意后的静默时长。**不放宽**——这是唯一的用户否决权
 pub const THEME_MUTE_SECS: i64 = 60 * 60;
-pub const DEDUP_WINDOW_SECS: i64 = 60 * 60; // 历史去重窗口(1h)
+/// 出稿正文去重窗口。1h 时同一项目一天最多约 4 张同类卡,实测大量"刚递过同款内容"
+pub const DEDUP_WINDOW_SECS: i64 = 20 * 60;
 /// G3 活性窗口:近 90s 内无事件即视为"Agent 空闲",不触发评估
 pub const ACTIVITY_WINDOW_SECS: i64 = 90;
 /// 决策日志内存窗口条数
@@ -108,12 +114,23 @@ pub struct GateContext<'a> {
     pub history: &'a [Card],
     /// "来一道":旁路频控(G2),不破队列上限
     pub force: bool,
+    /// 会话开场破冰(每个 session 首次评估)。旁路 G2 频控/同主题冷却与 G6 近似指纹,
+    /// 但**不旁路** G1 队列上限、G3 活性、用户显式"不再问这类"的静默期,
+    /// 也不旁路出稿后的正文护栏。目的:让"对话一开始"就有话可递。
+    pub opener: bool,
 }
 
 /// 事件是否驱动"写分支"
 pub fn is_write_event(e: &NormalizedEvent) -> bool {
     matches!(e.tool_name.as_str(), "edit" | "write" | "patch")
         && matches!(e.event_type.as_str(), "tool.completed" | "tool.started")
+}
+
+/// 事件是否驱动"知识分支"(一轮结束 = 用户正在等,是最低成本的递话时机)
+pub fn has_knowledge_signal(events: &[NormalizedEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| e.event_type == "turn.ended" || e.tool_name == "think")
 }
 
 /// 生成指纹(去重用):分支 + 主题 + 首个引用文件(确定性)
@@ -155,19 +172,31 @@ fn text_lower(s: &str) -> String {
     s.chars().take(600).collect::<String>().to_lowercase()
 }
 
-/// G5-A 评分:从事件 excerpt 本地字段提取信号(阈值 60)
+/// G5-A 评分:从**写事件**的 excerpt 本地字段提取信号(阈值见 `SCORE_THRESHOLD`)。
+///
+/// 两条口径是 2026-09-03 实测后钉死的:
+/// 1. **只统计写事件。** 旧实现对批内每条事件都打分,于是"读了 4 个 .md"
+///    这种纯浏览会话会累出 -100,把同窗口里一次真实大改的信号埋掉。
+/// 2. **罚分按批只扣一次。** 逐条累加等于按事件数放大罚分,同样埋没真实信号。
 pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
     let mut s = Scoring::default();
     let mut effective_api = false;
+    let mut format_hit = false;
+    let mut docs_hit = false;
+    let writes: Vec<&NormalizedEvent> = events.iter().filter(|e| is_write_event(e)).collect();
 
-    for e in events {
+    for e in &writes {
         let ex = &e.excerpt;
         let lower = text_lower(&format!("{} {}", ex.diff_head, ex.intent));
 
-        // lineDelta ≥ 20
+        // 变更规模分档:≥20 行是大改,8–19 行是"值得看一眼"的重构。
+        // 只有一档时,一次 8 行的重构恒为 0 分,连阈值都摸不到。
         if ex.line_delta >= 20 {
             s.score += 30;
             s.points.push(format!("{}:lineDelta≥20(+30)", e.tool_name));
+        } else if ex.line_delta >= 8 {
+            s.score += 15;
+            s.points.push(format!("{}:lineDelta≥8(+15)", e.tool_name));
         }
         // 新增 API/网络调用
         let api_hint = ex.has_api_call
@@ -213,36 +242,51 @@ pub fn signal_score(events: &[NormalizedEvent]) -> Scoring {
             s.score += 12;
             s.points.push("裸 throw 错误串(+12)".into());
         }
-        // 减分:纯格式化/重命名(<5 行)
-        let format_only = ex.line_delta < 5
-            && (lower.contains("format") || lower.contains("rename") || lower.contains("重构"));
-        if format_only {
-            s.score -= 30;
-            s.penalized.push("纯格式化/重命名(-30)".into());
+        // 罚分只记"命中过",扣金额在批末统一结算(见函数注释口径 2)
+        if ex.line_delta < 5
+            && (lower.contains("format") || lower.contains("rename") || lower.contains("重构"))
+        {
+            format_hit = true;
         }
-        // 减分:纯文档变更
         let docs = !ex.files.is_empty()
             && ex
                 .files
                 .iter()
                 .all(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"));
         if docs {
-            s.score -= 30;
-            s.penalized.push("纯 README/文档变更(-30)".into());
+            docs_hit = true;
         }
+    }
+
+    // 一次改动铺开到 3 个以上文件:影响面本身就是值得审的信号
+    let touched: std::collections::HashSet<&str> = writes
+        .iter()
+        .flat_map(|e| e.excerpt.files.iter().map(|s| s.as_str()))
+        .collect();
+    if touched.len() >= 3 {
+        s.score += 10;
+        s.points.push(format!("影响 {} 个文件(+10)", touched.len()));
+    }
+    if format_hit {
+        s.score -= 30;
+        s.penalized.push("纯格式化/重命名(-30)".into());
+    }
+    if docs_hit {
+        s.score -= 30;
+        s.penalized.push("纯 README/文档变更(-30)".into());
     }
 
     s.n_events = events.len();
     s.score = s.score.clamp(-100, 200);
 
-    // P0 判定:网络调用无异常处理 | 覆盖不完整
-    let intent_pool: String = events
+    // P0 判定:网络调用无异常处理 | 覆盖不完整(同样只看写事件)
+    let intent_pool: String = writes
         .iter()
         .map(|e| e.excerpt.intent.as_str())
         .collect::<Vec<_>>()
         .join(" ");
     let network_no_guard = effective_api
-        && !events
+        && !writes
             .iter()
             .any(|e| e.excerpt.diff_head.to_lowercase().contains("catch"));
     let coverage_short = intent_pool.contains("不完整")
@@ -289,23 +333,69 @@ pub fn pool_pick(seed: &str) -> String {
     TIP_POOL[idx].to_string()
 }
 
+/// 知识分支的候选主题:项目命中主题优先,其后是通用主题池。
+///
+/// 只给一个主题 = 每次出同一句话。实测:本项目 facts 恒推出 `vue-lifecycle`,
+/// 于是同主题冷却与正文去重把知识分支彻底堵死,用户点"来一道"只看到
+/// "刚递过同款内容"。轮换是"多输出"的前置条件,不是锦上添花。
+pub fn knowledge_candidates(facts: Option<&Facts>) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if let Some(f) = facts {
+        if !f.framework.trim().is_empty() {
+            v.push(theme_from_facts(f));
+        }
+    }
+    v.extend(TIP_POOL.iter().map(|s| s.to_string()));
+    v.dedup();
+    v
+}
+
+/// 选主题:先在被用户否决(静默)的主题之外,取"最久未问"的那个;
+/// 同样新近时按候选顺序(项目命中主题优先)。纯函数、0 token。
+///
+/// 全部候选都在静默期时,返回其中"最久未问"的一个 —— 让 G2 给出
+/// **可执行的**拒绝原因("主题处于静默期"),而不是静悄悄换个主题硬递。
+pub fn pick_knowledge_theme(
+    facts: Option<&Facts>,
+    cooldowns: &crate::queue::CooldownMap,
+    now: i64,
+) -> String {
+    let cands = knowledge_candidates(facts);
+    let best = |allow_muted: bool| {
+        cands
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| allow_muted || !cooldowns.is_muted(t, now))
+            .min_by_key(|(i, t)| (cooldowns.last_asked_at(t), *i))
+            .map(|(_, t)| t.clone())
+    };
+    best(false)
+        .or_else(|| best(true))
+        .unwrap_or_else(|| "project-mental-model".into())
+}
+
+/// 本批要递的知识主题。
+///
+/// 正常路径下 facts 缺失 → 出知情度卡(`framework-unknown`)。
+/// **破冰卡不允许出知情度卡**:铁律 4 规定知情度卡必须最后生成,
+/// 不能靠"会话开场旁路"抢在真正该递的话前面,所以它走主题池轮换。
+fn knowledge_theme(ctx: &GateContext) -> String {
+    let known = matches!(ctx.facts, Some(f) if !f.framework.trim().is_empty());
+    if !known && !ctx.opener {
+        return "framework-unknown".into();
+    }
+    pick_knowledge_theme(ctx.facts, ctx.cooldowns, ctx.now)
+}
+
 /// 预判知识主题(G2 冷却判定用):仅在会路由到知识分支时才需要
-fn prefer_theme(ctx: &GateContext) -> Option<String> {
-    if ctx.events.iter().any(is_write_event) {
+fn prefer_theme(ctx: &GateContext, review_wins: bool) -> Option<String> {
+    if review_wins {
         return None;
     }
-    let has_knowledge_signal = ctx
-        .events
-        .iter()
-        .any(|e| e.event_type == "turn.ended" || e.tool_name == "think");
-    if !has_knowledge_signal {
+    if !has_knowledge_signal(&ctx.events) && !ctx.force && !ctx.opener {
         return None;
     }
-    match ctx.facts {
-        None => Some("framework-unknown".into()),
-        Some(f) if f.framework.trim().is_empty() => Some("framework-unknown".into()),
-        Some(f) => Some(theme_from_facts(f)),
-    }
+    Some(knowledge_theme(ctx))
 }
 
 fn dedup_hit(ctx: &GateContext, branch: Branch, theme: &str, ref_file: &str) -> bool {
@@ -342,32 +432,52 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
             scoring,
         );
     }
-    // G2 频控
-    if !ctx.force {
+    // 路由预判:写信号达标才走审查,否则(有 turn.ended/think、force、破冰)走知识
+    let has_write = ctx.events.iter().any(is_write_event);
+    let knowledge_signal = has_knowledge_signal(&ctx.events);
+    let review_wins = has_write && scoring.score >= SCORE_THRESHOLD;
+
+    // G2 频控。"来一道"与"会话破冰"旁路间隔与同主题冷却;
+    // **静默期(用户点过"不再问这类"或连续 2 次不满意)任何路径都不旁路。**
+    if !ctx.force && !ctx.opener {
         if let Some(last) = ctx.last_card_at {
             if ctx.now - last < LAST_CARD_WINDOW_SECS {
                 return (
                     GateVerdict::Reject(
                         GateLevel::G2,
-                        format!("距上次弹卡仅 {}s(<60s 频控)", ctx.now - last),
+                        format!(
+                            "距上次弹卡仅 {}s(<{}s 频控)",
+                            ctx.now - last,
+                            LAST_CARD_WINDOW_SECS
+                        ),
                     ),
                     scoring,
                 );
             }
         }
-        if let Some(theme) = prefer_theme(ctx) {
-            if ctx.cooldowns.is_muted(&theme, ctx.now) {
-                return (
-                    GateVerdict::Reject(GateLevel::G2, format!("主题 [{theme}] 处于冷却中")),
-                    scoring,
-                );
-            }
-            if !theme.eq("framework-unknown") && ctx.cooldowns.recently_asked(&theme, ctx.now) {
-                return (
-                    GateVerdict::Reject(GateLevel::G2, format!("同主题 [{theme}] 30min 内已问过")),
-                    scoring,
-                );
-            }
+    }
+    if let Some(theme) = prefer_theme(ctx, review_wins) {
+        if ctx.cooldowns.is_muted(&theme, ctx.now) {
+            return (
+                GateVerdict::Reject(
+                    GateLevel::G2,
+                    format!("主题 [{theme}] 处于静默期(用户否决)"),
+                ),
+                scoring,
+            );
+        }
+        if !ctx.force
+            && !ctx.opener
+            && theme != "framework-unknown"
+            && ctx.cooldowns.recently_asked(&theme, ctx.now)
+        {
+            return (
+                GateVerdict::Reject(
+                    GateLevel::G2,
+                    format!("同主题 [{theme}] {}min 内已问过", THEME_COOLDOWN_SECS / 60),
+                ),
+                scoring,
+            );
         }
     }
     // G3 活性
@@ -378,17 +488,24 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
         );
     }
 
-    // G4 分支路由
-    let has_write = ctx.events.iter().any(is_write_event);
-    let has_knowledge_signal = ctx
-        .events
-        .iter()
-        .any(|e| e.event_type == "turn.ended" || e.tool_name == "think");
-    let branch: Branch = if has_write {
+    // G4 分支路由。旧实现是 `if has_write { Review }`(达标与否都要先落进审查),
+    // 于是窗口里只要混进一条写事件,同批的 turn.ended 就被彻底浪费 —— 实测
+    // 8 次 G5-A 拒绝的同时 events.log 里躺着 3 条 turn.ended。现在不达标就回落知识。
+    let branch: Branch = if review_wins {
         Branch::Review
-    } else if has_knowledge_signal || ctx.force {
-        // force = "来一道":用户主动要求,即使无事件也走知识分支
+    } else if knowledge_signal || ctx.force || ctx.opener {
         Branch::Knowledge
+    } else if has_write {
+        return (
+            GateVerdict::Reject(
+                GateLevel::G5A,
+                format!(
+                    "信号分 {} < 阈值 {SCORE_THRESHOLD},且无 turn.ended 可回落",
+                    scoring.score
+                ),
+            ),
+            scoring,
+        );
     } else {
         return (
             GateVerdict::Reject(
@@ -410,17 +527,9 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
 
     match branch {
         Branch::Review => {
-            if scoring.score < SCORE_THRESHOLD {
-                return (
-                    GateVerdict::Reject(
-                        GateLevel::G5A,
-                        format!("信号分 {} < 阈值 {SCORE_THRESHOLD}", scoring.score),
-                    ),
-                    scoring,
-                );
-            }
-            // force("来一道")时豁免:此处只是主题级近似,真实去重交给出稿后的正文护栏
-            if !ctx.force && dedup_hit(ctx, Branch::Review, "code-review", &ref_file) {
+            // force/opener 时豁免:此处只是主题级近似,真实去重交给出稿后的正文护栏
+            if !ctx.force && !ctx.opener && dedup_hit(ctx, Branch::Review, "code-review", &ref_file)
+            {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "审查指纹与队列/历史重复".into()),
                     scoring,
@@ -440,17 +549,9 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
             (GateVerdict::Pass(pass), scoring)
         }
         Branch::Knowledge => {
-            let (theme, is_awareness) = match ctx.facts {
-                Some(f) if !f.framework.trim().is_empty() => (theme_from_facts(f), false),
-                _ => ("framework-unknown".to_string(), true),
-            };
-            if !is_awareness && !ctx.force && ctx.cooldowns.recently_asked(&theme, ctx.now) {
-                return (
-                    GateVerdict::Reject(GateLevel::G2, format!("同主题 [{theme}] 30min 内已问过")),
-                    scoring,
-                );
-            }
-            if !ctx.force && dedup_hit(ctx, Branch::Knowledge, &theme, &ref_file) {
+            let theme = knowledge_theme(ctx);
+            let is_awareness = theme == "framework-unknown";
+            if !ctx.force && !ctx.opener && dedup_hit(ctx, Branch::Knowledge, &theme, &ref_file) {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "知识卡指纹与队列/历史重复".into()),
                     scoring,
@@ -463,6 +564,8 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
                 theme_hint: theme,
                 reason: if is_awareness {
                     "知识缺口:框架未知 → 知情度问题(最高优先)".into()
+                } else if ctx.opener {
+                    "会话开场破冰:知识贴士".into()
                 } else {
                     "知识贴士:命中已有主题".into()
                 },
@@ -590,6 +693,7 @@ mod tests {
             pending_cards: pending,
             history,
             force: false,
+            opener: false,
         }
     }
 
@@ -643,13 +747,16 @@ mod tests {
     }
 
     #[test]
-    fn g2_theme_cooldown_rejects() {
+    fn g2_theme_cooldown_rejects_when_every_candidate_is_cooled() {
         let mut cd = CooldownMap::default();
-        cd.touch_asked("vue-lifecycle", 100);
         let facts = Facts {
             framework: "Vue3".into(),
             ..Default::default()
         };
+        // 主题轮换后,单个主题被冷却不再等于知识分支被堵死:必须全部候选都在冷却里才拒
+        for t in knowledge_candidates(Some(&facts)) {
+            cd.touch_asked(&t, 1400);
+        }
         let events = vec![ev(
             "turn.ended",
             "think",
@@ -661,9 +768,248 @@ mod tests {
             false,
             false,
         )];
-        // now=1500,距上次问询 1400s < 30min=1800s → G2 拒绝
+        // now=1500,距上次问询 100s < THEME_COOLDOWN_SECS=600s → G2 拒绝
         let (v, _) = evaluate(&ctx(events, 0, None, &cd, Some(&facts), &[], &[], 1500));
         assert!(matches!(v, GateVerdict::Reject(GateLevel::G2, _)));
+    }
+
+    #[test]
+    fn knowledge_theme_rotates_to_least_recently_asked() {
+        let facts = Facts {
+            framework: "Vue3".into(),
+            ..Default::default()
+        };
+        let mut cd = CooldownMap::default();
+        // 都没问过 → 项目命中主题优先
+        assert_eq!(
+            pick_knowledge_theme(Some(&facts), &cd, 2000),
+            "vue-lifecycle"
+        );
+        // 刚问过项目主题 → 轮换到通用池的第一个,而不是死守同一句话
+        cd.touch_asked("vue-lifecycle", 1000);
+        assert_eq!(
+            pick_knowledge_theme(Some(&facts), &cd, 2000),
+            "project-mental-model"
+        );
+        cd.touch_asked("project-mental-model", 1001);
+        assert_eq!(
+            pick_knowledge_theme(Some(&facts), &cd, 2000),
+            "tooling-tips"
+        );
+        // 用户否决过的主题被绕开,但知识分支仍然出话
+        cd.mute("tooling-tips", 2000);
+        assert_eq!(
+            pick_knowledge_theme(Some(&facts), &cd, 2000),
+            "api-error-handling"
+        );
+    }
+
+    /// 回归:罚分不得作用于读事件。旧实现里"读了 4 个 .md"会累出 -100,
+    /// 把同窗口内一次真实大改(+82)压到阈值以下,审查卡就此消失。
+    #[test]
+    fn doc_reads_do_not_bury_a_real_write_signal() {
+        let mut events = vec![
+            ev(
+                "tool.completed",
+                "read",
+                0,
+                vec!["README.md"],
+                "",
+                "看文档",
+                false,
+                false,
+                false
+            );
+            4
+        ];
+        events.extend(big_write());
+        let s = signal_score(&events);
+        assert!(
+            s.score >= SCORE_THRESHOLD,
+            "纯读文档不应给同批的写事件扣分:实际 {s:?}"
+        );
+    }
+
+    /// 回归:8 行的普通重构在旧口径下恒为 0 分。
+    #[test]
+    fn small_refactor_with_todo_clears_the_threshold() {
+        let events = vec![ev(
+            "tool.completed",
+            "edit",
+            12,
+            vec!["src/a.ts", "src/b.ts", "src/c.ts"],
+            "+// TODO: 补错误分支",
+            "抽取公共校验",
+            false,
+            false,
+            true,
+        )];
+        let s = signal_score(&events);
+        assert!(s.score >= SCORE_THRESHOLD, "实际 {s:?}");
+    }
+
+    /// 回归:写事件信号不足时,同批的 turn.ended 必须回落到知识分支,
+    /// 而不是整批被 G5-A 打死(实测有 8 次 G5-A 拒绝,同期 events.log 里躺着 3 条 turn.ended)。
+    #[test]
+    fn weak_review_signal_falls_back_to_knowledge_on_turn_ended() {
+        let cd = CooldownMap::default();
+        let mut events = vec![ev(
+            "tool.completed",
+            "edit",
+            2,
+            vec!["src/app.ts"],
+            "rename",
+            "纯格式化 rename",
+            false,
+            false,
+            false,
+        )];
+        events.push(ev(
+            "turn.ended",
+            "",
+            0,
+            vec![],
+            "",
+            "这轮改完了",
+            false,
+            false,
+            false,
+        ));
+        let (v, s) = evaluate(&ctx(events, 0, None, &cd, None, &[], &[], 2000));
+        assert!(s.score < SCORE_THRESHOLD, "前提:审查信号确实不达标");
+        match v {
+            GateVerdict::Pass(p) => {
+                assert_eq!(p.branch, Branch::Knowledge);
+                assert_eq!(p.theme_hint, "framework-unknown");
+            }
+            other => panic!("审查不达标应回落知识分支,实际 {other:?}"),
+        }
+    }
+
+    /// 破冰:每个 session 的第一次评估即使只有读事件、且刚弹过卡,也应放行一张知识卡。
+    #[test]
+    fn opener_bypasses_rate_limit_with_read_only_batch() {
+        let cd = CooldownMap::default();
+        let facts = Facts {
+            framework: "Vue3".into(),
+            ..Default::default()
+        };
+        let events = vec![ev(
+            "tool.completed",
+            "read",
+            0,
+            vec!["src/main.ts"],
+            "",
+            "看入口",
+            false,
+            false,
+            false,
+        )];
+        // 距上次弹卡 3s:非破冰会被 G2 挡,破冰放行
+        let mut c = ctx(
+            events.clone(),
+            0,
+            Some(1997),
+            &cd,
+            Some(&facts),
+            &[],
+            &[],
+            2000,
+        );
+        let (v, _) = evaluate(&c);
+        assert!(
+            matches!(v, GateVerdict::Reject(GateLevel::G2, _)),
+            "前提:常规路径被频控挡住"
+        );
+        c.opener = true;
+        let (v, _) = evaluate(&c);
+        match v {
+            GateVerdict::Pass(p) => assert_eq!(p.branch, Branch::Knowledge),
+            other => panic!("破冰应放行一张知识卡:{other:?}"),
+        }
+    }
+
+    /// 铁律 4:破冰不许抢知情度卡(它是唯一能让 Agent 反问"项目用什么框架"的卡型)
+    #[test]
+    fn opener_never_produces_the_awareness_card() {
+        let cd = CooldownMap::default();
+        let events = vec![ev(
+            "tool.completed",
+            "read",
+            0,
+            vec!["src/main.ts"],
+            "",
+            "看入口",
+            false,
+            false,
+            false,
+        )];
+        let mut c = ctx(events, 0, None, &cd, None, &[], &[], 2000);
+        c.opener = true;
+        let (v, _) = evaluate(&c);
+        match v {
+            GateVerdict::Pass(p) => assert_ne!(p.theme_hint, "framework-unknown"),
+            other => panic!("破冰应出知识贴士:{other:?}"),
+        }
+    }
+
+    /// 破冰不吃用户否决权:显式"不再问这类"的静默期仍然拦得住
+    #[test]
+    fn opener_still_respects_theme_mute() {
+        let mut cd = CooldownMap::default();
+        cd.mute("vue-lifecycle", 2000);
+        let facts = Facts {
+            framework: "Vue3".into(),
+            ..Default::default()
+        };
+        let events = vec![ev(
+            "tool.completed",
+            "read",
+            0,
+            vec!["src/main.ts"],
+            "",
+            "看入口",
+            false,
+            false,
+            false,
+        )];
+        let mut c = ctx(events, 0, None, &cd, Some(&facts), &[], &[], 2000);
+        c.opener = true;
+        let (v, _) = evaluate(&c);
+        assert!(
+            matches!(v, GateVerdict::Pass(ref p) if p.theme_hint != "vue-lifecycle"),
+            "静默主题必须被绕开,但知识分支仍要出话:{v:?}"
+        );
+    }
+
+    /// 破冰不破队列硬闸(G1 仍是唯一不可旁路的闸门)
+    #[test]
+    fn opener_still_blocked_by_full_queue() {
+        let cd = CooldownMap::default();
+        let events = vec![ev(
+            "tool.completed",
+            "read",
+            0,
+            vec!["src/main.ts"],
+            "",
+            "看入口",
+            false,
+            false,
+            false,
+        )];
+        let mut c = ctx(
+            events,
+            crate::queue::MAX_PENDING,
+            None,
+            &cd,
+            None,
+            &[],
+            &[],
+            2000,
+        );
+        c.opener = true;
+        let (v, _) = evaluate(&c);
+        assert!(matches!(v, GateVerdict::Reject(GateLevel::G1, _)));
     }
 
     #[test]

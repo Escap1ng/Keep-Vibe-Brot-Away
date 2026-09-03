@@ -71,12 +71,17 @@ impl CooldownMap {
             .unwrap_or(false)
     }
 
-    /// 同主题 30 分钟内是否已问
+    /// 同主题在 `THEME_COOLDOWN_SECS` 内是否已问过
     pub fn recently_asked(&self, theme: &str, now: i64) -> bool {
+        now - self.last_asked_at(theme) < crate::gate::THEME_COOLDOWN_SECS
+    }
+
+    /// 该主题上次被问的时间(从未问过 = 0)。供知识分支的主题轮换取"最久未问"
+    pub fn last_asked_at(&self, theme: &str) -> i64 {
         self.themes
             .get(theme)
-            .map(|t| now - t.last_asked_at < crate::gate::THEME_COOLDOWN_SECS)
-            .unwrap_or(false)
+            .map(|t| t.last_asked_at)
+            .unwrap_or_default()
     }
 
     /// 记录一次问询

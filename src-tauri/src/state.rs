@@ -89,6 +89,9 @@ pub struct ProjectLive {
     pub dialog: VecDeque<String>,
     /// 自上次增量精炼以来被消费的问题数(≥20 触发合并)
     pub consumed_since_merge: u32,
+    /// 已递过"开场破冰卡"的会话 id。每个 session 只破冰一次(瞬态,不落盘):
+    /// 破冰旁路频控与主题冷却,若允许它每轮都触发,产品就退化成弹窗广告。
+    pub opener_session: Option<String>,
 }
 
 /// 本地 HTTP 端点信息(写入 endpoint.json 供适配器读取)
@@ -332,6 +335,8 @@ pub struct PipelineSnapshot {
     pub facts: Option<Facts>,
     pub cooldowns: crate::queue::CooldownMap,
     pub history: Vec<crate::queue::Card>,
+    /// 本批是否为「会话开场破冰」(该 session 尚未递过话)
+    pub opener: bool,
     pub last_event_id: String,
 }
 

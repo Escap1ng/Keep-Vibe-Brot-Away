@@ -148,7 +148,7 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
 
     // 阶段 1:同步快照(锁内;作用域结束即释放)
     let snapshot = {
-        let core = state.core.blocking_lock();
+        let mut core = state.core.blocking_lock();
         if core.paused && !force {
             log::debug!("暂停中,跳过门控");
             return PipelineOutcome::Paused;
@@ -156,6 +156,30 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         let Some(key) = core.active_project.clone() else {
             log::debug!("无活动项目,跳过门控");
             return PipelineOutcome::NoProject;
+        };
+        // 开场破冰:该 session 还没递过话,就允许它旁路一次 G2/G6。
+        // **判定即记账** —— 一次评估只破冰一次,否则每条事件都拿着旁路令牌,
+        // 频控形同虚设(那正是规格 1.3 节要避免的"弹窗广告")。
+        // force(手动"来一道")不吃这张令牌:用户主动请求不该把会话的开场机会用掉。
+        // 单独成块:这里要可变借用 projects,不能和下面的只读快照共用作用域。
+        let opener = {
+            match core.projects.get_mut(&key) {
+                Some(live) => {
+                    let session = live
+                        .events
+                        .back()
+                        .map(|e| e.session_id.clone())
+                        .unwrap_or_default();
+                    let hit = !force
+                        && !session.is_empty()
+                        && live.opener_session.as_deref() != Some(session.as_str());
+                    if hit {
+                        live.opener_session = Some(session);
+                    }
+                    hit
+                }
+                None => false,
+            }
         };
         let Some(live) = core.projects.get(&key) else {
             return PipelineOutcome::NoProject;
@@ -189,6 +213,7 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
             facts,
             cooldowns,
             history,
+            opener,
             last_event_id,
         }
     };
@@ -205,6 +230,7 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         pending_cards: &snapshot.pending,
         history: &snapshot.history,
         force,
+        opener: snapshot.opener,
     };
     let (verdict, scoring) = crate::gate::evaluate(&ctx);
     let elapsed = t0.elapsed().as_millis() as u64;
