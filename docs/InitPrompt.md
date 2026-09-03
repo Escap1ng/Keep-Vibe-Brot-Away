@@ -85,13 +85,14 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 
 ## 4. 事件摄入(截流)
 
-### 4.1 适配器(两个 + 一个兜底)
+### 4.1 适配器(三个,其一为兜底)
 
 | 适配器 | 方式 | 形态 |
 |---|---|---|
 | Claude Code 主适配器 | 官方 Hooks:PostToolUse/Stop → `kvba-claude-bridge`(Rust 二进制,stdin 收 hook JSON,POST 上报) | Rust |
 | Claude Code 兜底 | 监听 `~/.claude/projects/**/*.jsonl` 增量,解析工具调用与消息(方案 C) | Rust watcher |
 | opencode 适配器 | 官方插件 API,订阅事件(tool.execute.after、message.updated 等),POST 上报 | TS 插件 |
+| Trae 适配器 | Hooks:PostToolUse/Stop → `kvba-trae-hook`(Node 脚本,读 stdin JSON 后 POST 上报;工具名映射为规范小写名,`RunCommand` 不计写事件) | Node 脚本 |
 
 - 适配器向主程序 `POST /kvba/hello` 以本地随机 token 换取事件上报 token;
 - 上报失败重试 3 次后丢弃,绝不影响 Agent;
@@ -103,7 +104,7 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 {
   "schema": "kvba.event.v1",
   "id": "blake3哈希",
-  "emitter": "claude-code-bridge | claude-code-watcher | opencode-plugin",
+  "emitter": "claude-code-bridge | claude-code-watcher | opencode-plugin | trae-hook",
   "eventType": "tool.completed | tool.started | turn.ended | message.updated | session.ended",
   "toolName": "edit | write | patch | think | read | bash | grep | 其他",
   "ts": 0,
