@@ -5,6 +5,19 @@
 KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相关的知识点、审查质疑、知情度提问"递"给用户。它不是一个弹窗广告,而是一个**被用户消费的节奏**——问题队列最多 3 张,用户不消费,它就沉默。
 
 > **动手改这个仓库之前,先读 [docs/复盘与工程约定.md](docs/复盘与工程约定.md)。** 那里记着已经付过学费的地方:哪些是铁律、哪些坑别再踩、以及这份文档要求你如何诚实更新它。
+>
+> 新加入的协作者请从 [docs/HANDOVER.md](docs/HANDOVER.md) 入手——那里是全貌速览与已知问题清单。
+
+## 目录
+
+- [安装](#安装)：环境要求 / 启动 / 配置 LLM / 三种 Agent 联动 / 端点发现
+- [使用方式(产品循环)](#使用方式产品循环)
+- [架构](#架构)
+- [数据目录](#数据目录)
+- [目录结构](#目录结构)
+- [持续集成与发布](#持续集成与发布)
+- [已知边界](#已知边界)
+- [文档索引](#文档索引)
 
 ```text
 CodingAgent(opencode / Claude Code / Trae)
@@ -218,9 +231,10 @@ src-tauri/            Rust 核心(gate/events/memory/llm/crypto/queue/http + win
 src/                  Vue3 + Vite 前端(胶囊圆点、面板、设置/历史/决策日志)
 adapters/
   claude-code/        Rust 桥:kvba-claude-bridge(stdin hook)+kvba-claude-watcher(jsonl)
-  opencode-plugin/    TS 插件(kvba-plugin.ts)
+  opencode-plugin/    TS 插件(kvba-plugin.ts;部署副本 .opencode/plugins/,CI 强制两者一致)
   trae-hook/          Node 脚本适配器(kvba-trae-hook.mjs + hooks.sample.json)
 docs/                 规格与文档(改本仓库前必读 复盘与工程约定.md)
+.github/workflows/    CI 与三平台发布流水线
 ```
 
 ## 持续集成与发布
@@ -244,3 +258,12 @@ docs/                 规格与文档(改本仓库前必读 复盘与工程约�
 - LLM 分析超时(180s)与重试(指数退避 ×2)后丢弃本次卡片,不影响后续批次。一次分析最多只占一格当日额度(契约解析失败的严格重试不再重复计费)。
 - Claude Code 的 bridge(hook)与 watcher(JSONL 兜底)同开时,同一动作会被报两遍。事件 `id` 由各适配器自生成、两边不同,因此服务端按 **emitter 无关的内容指纹**(项目 + 事件类型 + 工具 + 意图 + 文件名 + 事件秒)在 5s 窗口内判重并静默 ACK。若两路边缘字段(如意图文本)不一致,仍可能漏判为两条事件——后果只是信号权重略高,不会丢数据。
 - `endpoint.json` 是适配器发现本地端点的唯一入口。端口/token 每次重启随机化,若该文件写入失败(权限/目录被删),适配器将无法配对而静默失效,而 KVBA 本体仍可用——此时看启动日志中的 `写入 ... 失败` 一行。**删除 `endpoint.json` 并重启 KVBA 即可重置配对**(后需重启各 Agent 会话让适配器重读)。
+
+## 文档索引
+
+| 文档 | 内容 | 什么时候读 |
+|---|---|---|
+| [docs/HANDOVER.md](docs/HANDOVER.md) | 项目交接报告:全貌速览、模块地图、已知问题清单、清理记录 | 新协作者入门第一站 |
+| [docs/复盘与工程约定.md](docs/复盘与工程约定.md) | 六轮复盘、铁律、缺陷现场证据、出稿判读表 | **改本仓库前必读** |
+| [docs/InitPrompt.md](docs/InitPrompt.md) | 原始技术规格书:问题定义、架构、门控树、里程碑 | 理解设计意图与取舍 |
+| [docs/codebase-research.md](docs/codebase-research.md) | 代码库研究报告与规格-实现对账(2026-09-03) | 核对规格与代码差异 |
