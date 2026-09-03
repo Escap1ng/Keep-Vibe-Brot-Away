@@ -154,6 +154,19 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
 
   const sessionProject = directory || process.env.PWD || "";
 
+  // 会话 id 必须上报:服务端的「会话开场破冰」按 sessionId 记账(每个 session 一次),
+  // 留空会让这一路永远拿不到破冰卡 —— 而 opencode 恰恰是最需要它的宿主(用户主动等 Agent 干活)。
+  // @opencode-ai/plugin 的类型里有没有这个字段本机无法验证,故一律显式断言 + 可选链。
+  let lastSessionId = "";
+  function noteSessionId(...candidates: unknown[]) {
+    for (const c of candidates) {
+      if (typeof c === "string" && c.length > 0) {
+        lastSessionId = c;
+        return;
+      }
+    }
+  }
+
   function emit(
     eventType: string,
     tool: string,
@@ -176,7 +189,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
       toolName: tool,
       ts,
       projectPath: sessionProject,
-      sessionId: "",
+      sessionId: lastSessionId,
       excerpt: {
         files,
         diffHead: diffHead.slice(0, MAX_DIFF_CHARS),
@@ -192,6 +205,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
   return {
     "tool.execute.before": async (input, output) => {
       if (!ensureEndpoint()) return;
+      noteSessionId((input as { sessionID?: string }).sessionID);
       const key = callKey(input);
       lastArgs.set(key, output?.args ?? null);
       // 并发工具调用数不可控:超上限丢最旧(纯兜底表,丢了只是少一路参数)
