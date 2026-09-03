@@ -103,22 +103,14 @@ pub fn try_drain_batch(state: &Arc<AppState>) {
         let pass = item.pass.clone();
         match crate::llm::analyze_pass_for_project(&state, &pass, &item.project_path).await {
             Ok(analysis) => {
-                let inserted = crate::queue::push_pass_card(
+                let outcome = crate::queue::push_pass_card(
                     &state.app,
                     &state,
                     &pass,
                     analysis,
                     item.ref_event_id.clone(),
                 );
-                log::info!(
-                    "攒批消费:{}(主题={})",
-                    if inserted {
-                        "成功入队"
-                    } else {
-                        "未入队(队列满/重复)"
-                    },
-                    pass.theme_hint
-                );
+                log::info!("攒批消费:{outcome:?}(主题={})", pass.theme_hint,);
             }
             Err(e) => {
                 if e.starts_with(BUDGET_EXCEEDED_PREFIX) {

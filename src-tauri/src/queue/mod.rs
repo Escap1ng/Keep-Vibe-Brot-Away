@@ -150,16 +150,28 @@ pub fn build_card(
     }
 }
 
+/// 入队结局。必须区分:把"队列已满"与"内容雷同"混成一条提示,使用者就再也
+/// 无从判断该去消费卡片还是该换个主题 —— 这次误诊正是源于此。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    /// 队列已满且不允许替换
+    QueueFull,
+    /// 正文与在队/近期历史卡片雷同
+    Duplicate,
+}
+
 /// 卡片入队(队列满时:默认丢弃;P0 且设置允许 → 替换最旧一张)
-/// 含并发护栏:同指纹卡在 1h 内已存在(队列或历史)则拒绝入队,消除异步管线竞态重复
+///
+/// 去重口径 = **正文**指纹(出稿后的真判据):同款正文即便主题不同也不该再递一遍。
+/// 主题级近似(省钱闸)由 G6 负责,两者职责不重叠,不可混用同一指纹。
 pub fn insert_card(
     core: &mut crate::state::Core,
     card: Card,
     emit: &dyn Fn(&str, &Card),
-) -> Option<Card> {
-    // 竞态护栏:同指纹去重(与 G6 同规则,但加锁后复查)
-    let fp = crate::gate::fingerprint_for_card(&card);
+) -> InsertOutcome {
     let now = now_ts();
+    let fp = crate::gate::fingerprint_text_for_card(&card);
     let dup = core
         .queue
         .iter()
@@ -169,10 +181,10 @@ pub fn insert_card(
                 .iter()
                 .filter(|c| now - c.created_at < crate::gate::DEDUP_WINDOW_SECS),
         )
-        .any(|c| crate::gate::fingerprint_for_card(c) == fp);
+        .any(|c| crate::gate::fingerprint_text_for_card(c) == fp);
     if dup {
-        log::info!("竞态护栏:同指纹卡片已存在,丢弃重复卡(theme={})", card.theme);
-        return None;
+        log::info!("正文去重:同款卡片 1h 内已递过(theme={})", card.theme);
+        return InsertOutcome::Duplicate;
     }
 
     let pending_count = core.queue.iter().filter(|c| c.status == "pending").count();
@@ -186,7 +198,7 @@ pub fn insert_card(
                 archive_card(core, old_card);
             }
         } else {
-            return None;
+            return InsertOutcome::QueueFull;
         }
     }
 
@@ -197,7 +209,7 @@ pub fn insert_card(
     core.stats.cards_created += 1;
     core.queue.push_back(card.clone());
     emit("card.new", &card);
-    Some(card)
+    InsertOutcome::Inserted
 }
 
 /// 归档已退场的卡片:移出队列并计入历史(上限 HISTORY_MAX,丢最旧)
@@ -462,14 +474,14 @@ pub fn queue_answer(
     Ok(card)
 }
 
-/// LLM 分析通过(G7)后:生成卡片并推送;返回是否成功入队(供"来一道"回传真实结局)
+/// LLM 分析通过(G7)后:生成卡片并推送;返回入队结局(供"来一道"回传真实原因)
 pub fn push_pass_card(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     pass: &GatePass,
     analysis: crate::llm::AnalysisOut,
     ref_event_id: String,
-) -> bool {
+) -> InsertOutcome {
     let severity = analysis.severity.clone();
     let theme = if analysis.theme.is_empty() {
         pass.theme_hint.clone()
@@ -492,20 +504,19 @@ pub fn push_pass_card(
     };
 
     let app2 = app.clone();
-    let inserted = insert_card(
+    let outcome = insert_card(
         &mut state.core.blocking_lock(),
         card.clone(),
         &move |ev, c| {
             crate::state::emit(&app2, ev, c);
         },
-    )
-    .is_some();
+    );
     crate::state::save_core(state);
-    if inserted {
+    if matches!(outcome, InsertOutcome::Inserted) {
         // 新卡 → 展开胶囊
         crate::windows::show_panel(app);
     }
-    inserted
+    outcome
 }
 
 #[cfg(test)]
@@ -519,7 +530,8 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             kind: kind.into(),
             severity: severity.into(),
-            text: "?".into(),
+            // 正文必须随主题变化:入队去重的判据是正文,全用同一句会让"队列上限"用例先撞去重
+            text: format!("?{theme}"),
             options: PENDING_OPTIONS.iter().map(|s| s.to_string()).collect(),
             theme: theme.into(),
             ref_files: vec![ref_file.to_string()],
@@ -563,24 +575,28 @@ mod tests {
     fn insert_card_respects_queue_cap_and_default_discards() {
         let mut core = Core::empty(Settings::default());
         for i in 0..3 {
-            assert!(insert_card(
-                &mut core,
-                mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")),
-                &noop_emit()
-            )
-            .is_some());
+            assert_eq!(
+                insert_card(
+                    &mut core,
+                    mk_card(&format!("t{i}"), "tips", "info", &format!("f{i}.ts")),
+                    &noop_emit()
+                ),
+                InsertOutcome::Inserted
+            );
         }
         assert_eq!(
             core.queue.iter().filter(|c| c.status == "pending").count(),
             3
         );
         // 队列满:默认配置下直接丢弃
-        assert!(insert_card(
-            &mut core,
-            mk_card("t3", "tips", "info", "f3.ts"),
-            &noop_emit()
-        )
-        .is_none());
+        assert_eq!(
+            insert_card(
+                &mut core,
+                mk_card("t3", "tips", "info", "f3.ts"),
+                &noop_emit()
+            ),
+            InsertOutcome::QueueFull
+        );
         assert_eq!(core.queue.len(), 3);
     }
 
@@ -603,7 +619,7 @@ mod tests {
             mk_card("code-review", "review", "P0", "fx.ts"),
             &noop_emit(),
         );
-        assert!(r.is_some(), "P0 允许替换时应入队");
+        assert_eq!(r, InsertOutcome::Inserted, "P0 允许替换时应入队");
         assert_eq!(
             core.queue.iter().filter(|c| c.status == "pending").count(),
             3,
@@ -619,14 +635,90 @@ mod tests {
     }
 
     #[test]
-    fn insert_card_rejects_duplicate_fingerprint() {
+    fn insert_card_rejects_duplicate_text() {
         let mut core = Core::empty(Settings::default());
         let c1 = mk_card("vue-lifecycle", "tips", "info", "a.ts");
-        assert!(insert_card(&mut core, c1.clone(), &noop_emit()).is_some());
-        // 同主题同引用文件 → 同指纹,id 却不同;竞态护栏应拒绝
+        assert_eq!(
+            insert_card(&mut core, c1.clone(), &noop_emit()),
+            InsertOutcome::Inserted
+        );
+        // 同主题同引用文件 → 同正文,id 却不同;应判为雷同
         let c2 = mk_card("vue-lifecycle", "tips", "info", "a.ts");
         assert_ne!(c1.id, c2.id);
-        assert!(insert_card(&mut core, c2, &noop_emit()).is_none());
+        assert_eq!(
+            insert_card(&mut core, c2, &noop_emit()),
+            InsertOutcome::Duplicate
+        );
+    }
+
+    /// 本次线上故障的反证:入队去重只看正文,不再看"主题+事件首文件"。
+    /// 否则 G6(主题级近似)与护栏口径不一致,会出现"门控放行、入队却莫名被拒"。
+    #[test]
+    fn same_theme_different_text_is_admitted() {
+        let mut core = Core::empty(Settings::default());
+        let mut a = mk_card("framework-unknown", "tips", "info", "src/App.vue");
+        a.text = "这个仓库没有 README,新人怎么知道从哪跑起来?".into();
+        let mut b = mk_card("framework-unknown", "tips", "info", "src/App.vue");
+        b.text = "同一个 framework-unknown 主题,但这次问的是测试策略。".into();
+        assert_eq!(
+            insert_card(&mut core, a, &noop_emit()),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            insert_card(&mut core, b, &noop_emit()),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(core.queue.len(), 2);
+    }
+
+    /// 仍在队未消费的卡片:不受 1h 窗口影响,任何时候都算重复
+    /// (否则会把同一句话同时挂两份在胶囊里)
+    #[test]
+    fn pending_card_blocks_same_text_regardless_of_age() {
+        let mut core = Core::empty(Settings::default());
+        let c = mk_card("vue-lifecycle", "tips", "info", "a.ts");
+        assert_eq!(
+            insert_card(&mut core, c.clone(), &noop_emit()),
+            InsertOutcome::Inserted
+        );
+        core.queue.make_contiguous().iter_mut().for_each(|k| {
+            k.created_at -= crate::gate::DEDUP_WINDOW_SECS + 10;
+        });
+        assert_eq!(
+            insert_card(&mut core, c, &noop_emit()),
+            InsertOutcome::Duplicate,
+            "卡片还挂在队里就不该再递同款"
+        );
+    }
+
+    /// 已归档卡片:1h 窗口内挡、窗口外放行(只防短期复读,不做永久封禁)。
+    /// 现场故障即 ②:19:44 那张卡 28 分钟后仍把同款挡在门外。
+    #[test]
+    fn archived_card_blocks_same_text_only_within_window() {
+        let mut core = Core::empty(Settings::default());
+        let c = mk_card("vue-lifecycle", "tips", "info", "a.ts");
+        assert_eq!(
+            insert_card(&mut core, c.clone(), &noop_emit()),
+            InsertOutcome::Inserted
+        );
+        // 消费退场 → 归档进历史(created_at 保持"刚刚")
+        let mut pending = std::mem::take(&mut core.queue);
+        for card in pending.drain(..) {
+            archive_card(&mut core, card);
+        }
+        assert_eq!(
+            insert_card(&mut core, c.clone(), &noop_emit()),
+            InsertOutcome::Duplicate,
+            "1h 内的同款仍应挡"
+        );
+        for h in core.history.iter_mut() {
+            h.created_at -= crate::gate::DEDUP_WINDOW_SECS + 10;
+        }
+        assert_eq!(
+            insert_card(&mut core, c, &noop_emit()),
+            InsertOutcome::Inserted,
+            "出窗口后同款可以再递"
+        );
     }
 
     #[test]

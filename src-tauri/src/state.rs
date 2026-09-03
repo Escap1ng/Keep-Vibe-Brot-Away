@@ -44,11 +44,31 @@ use crate::memory::Facts;
 use crate::queue::{Card, CooldownMap};
 use crate::settings::Settings;
 
-/// 项目键:由项目路径计算(sha256 + 前缀),作为事件/记忆隔离的 key
+/// 项目路径归一化。
+/// 不同适配器(甚至同一适配器的不同会话)会给出 `C:\repo\app`、`c:/repo/app/` 等
+/// 多种写法;不归一就会让**同一个项目裂成两个记忆目录**,事件窗口与 facts 互相
+/// 看不见 —— 表现为"记忆总是空的、facts 永远生成不出来"。
+pub fn normalize_project_path(p: &str) -> String {
+    let mut s = p.trim().replace('\\', "/");
+    while s.contains("//") {
+        s = s.replace("//", "/");
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    #[cfg(windows)]
+    {
+        // Windows 路径大小写不敏感
+        s = s.to_ascii_lowercase();
+    }
+    s
+}
+
+/// 项目键:由**归一化后**的项目路径计算(sha256 前缀),作为事件/记忆隔离的 key
 pub fn project_key(project_path: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(project_path.as_bytes());
+    h.update(normalize_project_path(project_path).as_bytes());
     let out = format!("{:x}", h.finalize());
     out[..16].to_string()
 }
@@ -143,9 +163,24 @@ pub struct Core {
     pub budget_toast_shown: bool,
     /// 上次摄入事件时间(活性检测)
     pub last_event_in: Option<i64>,
+    /// 本次进程累计成功摄入的事件条数(不含被内容判重丢弃的):
+    /// 只给 `last_event_in` 无法区分"链路通了但 Agent 闲置"与"一条都没进来"
+    pub events_ingested: u64,
     /// 被暂停(设置) / 胶囊隐藏标记
     pub paused: bool,
     pub capsule_hidden: bool,
+    /// 胶囊前端状态机(idle / active / popup),由前端上报、设置面板显示
+    pub capsule_state: String,
+    /// 正在生成 facts 首版的项目键(事件逐条进来,不去重就会每条都烧一次 LLM 预算)
+    pub facts_inflight: HashSet<String>,
+    /// facts 首版**连败**的项目键 → (失败次数, 冷却截止时间戳)。
+    /// `facts_inflight` 只挡并发,挡不住"这次失败了 → 下一条事件又来一遍":
+    /// 那是一条注定失败的路径在反复扣预算(实测单日 52 格里 47 格烧在这)。纯瞬态,不落盘。
+    pub facts_fail: HashMap<String, (u32, i64)>,
+    /// 内容级判重缓冲:(事件秒, emitter 无关指纹)。
+    /// bridge 与 watcher 同开时同一动作会被报两遍,而 id 由各适配器自生成、两边不同,
+    /// 靠 id 去不了重 —— 只能按内容指纹短期判重。纯瞬态,不落盘。
+    pub recent_event_fp: VecDeque<(i64, String)>,
 }
 
 /// 运行统计(§1.5 成功度量的本地埋点):当日计数 + 历史累计,持久化到 stats.json
@@ -206,8 +241,13 @@ impl Core {
             stats: Stats::today(),
             budget_toast_shown: false,
             last_event_in: None,
+            events_ingested: 0,
             paused: false,
             capsule_hidden: false,
+            capsule_state: "idle".into(),
+            facts_inflight: HashSet::new(),
+            facts_fail: HashMap::new(),
+            recent_event_fp: VecDeque::new(),
         }
     }
 
@@ -484,7 +524,11 @@ pub struct StatsTotals {
 #[serde(rename_all = "camelCase")]
 pub struct StatsInfo {
     pub last_event_in: Option<i64>,
+    /// 本次进程摄入的事件条数(诊断"适配器到底通没通")
+    pub events_ingested: u64,
     pub active_project: String,
+    /// 胶囊当前态(idle/active/popup):排查"卡片进了队列但看不见"时的第一手线索
+    pub capsule_state: String,
     pub cards_created: u64,
     pub answers: u64,
     pub unsatisfied: u64,
@@ -526,7 +570,9 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
     let s = &core.stats;
     StatsInfo {
         last_event_in: core.last_event_in,
+        events_ingested: core.events_ingested,
         active_project,
+        capsule_state: core.capsule_state.clone(),
         cards_created: s.cards_created,
         answers: s.answers,
         unsatisfied: s.unsatisfied,
@@ -544,6 +590,38 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_key_unifies_path_spellings() {
+        // 同一目录的不同写法必须落到同一个键,否则记忆会裂成两个项目
+        assert_eq!(
+            project_key(r"C:\repo\app"),
+            project_key("C:/repo/app"),
+            "分隔符差异必须归一"
+        );
+        assert_eq!(
+            project_key(r"C:\repo\app"),
+            project_key(r"C:\repo\app\"),
+            "尾部斜杠必须归一"
+        );
+        assert_eq!(
+            project_key(r"C:\repo\app"),
+            project_key("C:\\\\repo//app"),
+            "重复分隔符必须归一"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            project_key(r"C:\repo\app"),
+            project_key(r"c:/REPO/app"),
+            "Windows 路径大小写不敏感"
+        );
+    }
+
+    #[test]
+    fn project_key_keeps_different_projects_apart() {
+        assert_ne!(project_key(r"C:\repo\app"), project_key(r"C:\repo\other"));
+        assert_eq!(normalize_project_path(""), "");
+    }
 
     #[test]
     fn stats_roll_merges_day_change_only_once() {

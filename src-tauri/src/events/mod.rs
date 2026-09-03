@@ -1,4 +1,6 @@
-﻿//! 归一化事件 Schema + 摄入 + 滚动落盘(每项目 events.log JSONL,最近 200 条)
+//! 归一化事件 Schema + 摄入 + 滚动落盘(每项目 events.log JSONL,最近 200 条)
+
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +97,49 @@ pub fn hash_event(e: &NormalizedEvent) -> String {
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
 
+/// **emitter 无关**的内容指纹:project|eventType|tool|intent|文件名|事件秒。
+/// 刻意不含 id / emitter / session_id / diff 正文 —— bridge 与 watcher 同开时,
+/// 同一动作两边给出的这些字段各不相同(或一边为空),只有"哪个项目、什么动作、
+/// 碰了哪些文件、发生在哪一秒"是双方都能对上的稳定事实。
+/// 文件名只取 basename,避免一边给绝对路径、一边给相对路径。
+pub fn content_fingerprint(e: &NormalizedEvent) -> String {
+    let mut files: Vec<&str> = e.excerpt.files.iter().map(|f| base_name(f)).collect();
+    files.sort_unstable();
+    files.dedup();
+    let seed = format!(
+        "{}|{}|{}|{}|{}|{}",
+        e.project_path,
+        e.event_type,
+        e.tool_name,
+        e.excerpt.intent,
+        files.join(","),
+        e.ts
+    );
+    blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
+}
+
+fn base_name(p: &str) -> &str {
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+/// 内容判重缓冲的保鲜期(秒)与硬上限
+pub const CONTENT_DEDUP_SECS: i64 = 5;
+pub const CONTENT_DEDUP_MAX: usize = 512;
+
+/// 短期判重:命中返回 true;未命中则登记。
+/// 纯函数(不依赖 AppState),事件到达顺序可能轻微乱序,故按时间窗整体清理。
+pub fn seen_or_record(buf: &mut VecDeque<(i64, String)>, ts: i64, fp: &str) -> bool {
+    buf.retain(|(t, _)| *t >= ts - CONTENT_DEDUP_SECS);
+    if buf.iter().any(|(_, f)| f == fp) {
+        return true;
+    }
+    while buf.len() >= CONTENT_DEDUP_MAX {
+        buf.pop_front();
+    }
+    buf.push_back((ts, fp.to_string()));
+    false
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
@@ -103,19 +148,24 @@ fn truncate_chars(s: &str, max: usize) -> String {
 pub struct EventStore;
 
 impl EventStore {
-    /// 摄入事件:清洗 → 入内存窗口 → 滚动落盘。返回落库所用的清洗后事件。
+    /// 摄入事件:清洗 → 内容判重 → 入内存窗口 → 滚动落盘。
+    /// 返回 `None` 表示与 5s 内已摄入的事件内容重复(被静默丢弃,调用方仍应 ACK 200)。
     pub fn ingest(
         state: &std::sync::Arc<crate::state::AppState>,
         ev: NormalizedEvent,
-    ) -> anyhow::Result<NormalizedEvent> {
+    ) -> anyhow::Result<Option<NormalizedEvent>> {
         let ev = ev.sanitize().map_err(anyhow::Error::msg)?;
-        let dir = state.ensure_project_dir(&ev.project_path);
-
         let key = crate::state::project_key(&ev.project_path);
+        let fp = content_fingerprint(&ev);
         {
             let mut core = state.core.blocking_lock();
+            if seen_or_record(&mut core.recent_event_fp, ev.ts, &fp) {
+                log::debug!("忽略重复事件(指纹={fp}):emitter={}", ev.emitter);
+                return Ok(None);
+            }
             core.active_project = Some(key.clone());
             core.last_event_in = Some(crate::state::now_ts());
+            core.events_ingested += 1;
             let live = core.projects.entry(key).or_default();
 
             // 对话窗口:最近 DIALOG_WINDOW 条原始 JSON 截断副本,纯滚动替换(零 LLM 成本)
@@ -137,8 +187,9 @@ impl EventStore {
         }
 
         // 落盘失败不影响内存窗口(下次摄入会整体重写)
+        let dir = state.ensure_project_dir(&ev.project_path);
         let _ = Self::persist_rolling(&dir, &ev.project_path, state);
-        Ok(ev)
+        Ok(Some(ev))
     }
 
     /// 整体重写 events.log(JSONL,最多 ROLLING_LIMIT 条)
@@ -163,5 +214,101 @@ impl EventStore {
         };
         std::fs::write(dir.join("events.log"), text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(
+        emitter: &str,
+        id: &str,
+        tool: &str,
+        intent: &str,
+        files: &[&str],
+        ts: i64,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            schema: SCHEMA.into(),
+            id: id.into(),
+            emitter: emitter.into(),
+            event_type: "tool.completed".into(),
+            tool_name: tool.into(),
+            ts,
+            project_path: "C:/repo/app".into(),
+            session_id: format!("sess-{emitter}"),
+            excerpt: Excerpt {
+                files: files.iter().map(|s| s.to_string()).collect(),
+                diff_head: format!("diff-of-{emitter}"),
+                intent: intent.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn content_fingerprint_is_emitter_agnostic() {
+        // 同一动作被 bridge 与 watcher 各报一遍:id / emitter / session / diff 全不同
+        let a = ev(
+            "bridge",
+            "id-1",
+            "edit",
+            "改登录",
+            &["C:/repo/app/src/a.ts"],
+            1000,
+        );
+        let b = ev(
+            "watcher",
+            "id-2",
+            "edit",
+            "改登录",
+            &["C:/repo/app/src/a.ts"],
+            1000,
+        );
+        assert_eq!(content_fingerprint(&a), content_fingerprint(&b));
+    }
+
+    #[test]
+    fn path_style_and_file_order_do_not_change_fingerprint() {
+        let a = ev(
+            "bridge",
+            "1",
+            "edit",
+            "",
+            &["C:/repo/app/src/a.ts", "src/b.ts"],
+            1000,
+        );
+        let b = ev("watcher", "2", "edit", "", &["b.ts", "app/src/a.ts"], 1000);
+        assert_eq!(content_fingerprint(&a), content_fingerprint(&b));
+    }
+
+    #[test]
+    fn different_files_or_intents_are_not_duplicates() {
+        let base = ev("bridge", "1", "edit", "改登录", &["src/a.ts"], 1000);
+        let other_file = ev("bridge", "2", "edit", "改登录", &["src/z.ts"], 1000);
+        let other_intent = ev("bridge", "3", "edit", "改支付", &["src/a.ts"], 1000);
+        let other_tool = ev("bridge", "4", "read", "改登录", &["src/a.ts"], 1000);
+        let fp = content_fingerprint(&base);
+        for other in [&other_file, &other_intent, &other_tool] {
+            assert_ne!(fp, content_fingerprint(other));
+        }
+    }
+
+    #[test]
+    fn seen_or_record_dedups_within_window_then_forgets() {
+        let mut buf = VecDeque::new();
+        let fp = content_fingerprint(&ev("bridge", "1", "edit", "x", &["a.ts"], 1000));
+        assert!(!seen_or_record(&mut buf, 1000, &fp));
+        assert!(seen_or_record(&mut buf, 1000, &fp), "同一秒内应判重");
+        assert!(
+            seen_or_record(&mut buf, 1000 + CONTENT_DEDUP_SECS, &fp),
+            "保鲜期边界内仍判重"
+        );
+        assert!(
+            !seen_or_record(&mut buf, 1000 + CONTENT_DEDUP_SECS + 1, &fp),
+            "超窗后应重新放行"
+        );
+        assert_eq!(buf.len(), 1, "过期条目应被清掉");
     }
 }

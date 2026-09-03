@@ -37,16 +37,26 @@ pub fn run() {
 
             // 初始化全局状态(数据目录、设置、队列、记忆、统计等)
             let app_state = state::AppState::init(handle)?;
+            // manage 会移动所有权,这里留一份 Arc 给启动期的 facts 补生成
+            let state_arc = app_state.clone();
             app.manage(app_state);
 
             // 启动本地 HTTP 摄入服务(127.0.0.1 随机端口 + 随机 token)
             crate::http::start_server(handle);
+
+            // 为"重启前已有事件、但 facts 还没生成"的活动项目补一次 facts:
+            // 只在事件流入时 kick 会让 Agent 闲置期的项目永远拿不到记忆,
+            // 主题恒为 framework-unknown → 知识卡每次同一句话 → 被正文去重全部挡死
+            crate::memory::kick_facts_for_active(&state_arc);
 
             // 定位胶囊窗口(默认右缘中部)
             crate::windows::initial_position(handle);
 
             // 常驻窗口关闭保护(✕ → 隐藏)
             crate::windows::protect_windows_from_close(handle);
+
+            // 面板被拖出屏幕时整块钳回可见区
+            crate::windows::keep_panel_on_screen(handle);
 
             // 创建系统托盘
             crate::tray::build_tray(handle)?;
@@ -57,6 +67,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            crate::windows::capsule_set_state,
             crate::windows::dock_snap,
             crate::windows::panel_open,
             crate::windows::panel_close,

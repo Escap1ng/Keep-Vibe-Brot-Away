@@ -4,6 +4,8 @@
 
 KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相关的知识点、审查质疑、知情度提问"递"给用户。它不是一个弹窗广告,而是一个**被用户消费的节奏**——问题队列最多 3 张,用户不消费,它就沉默。
 
+> **动手改这个仓库之前,先读 [docs/复盘与工程约定.md](docs/复盘与工程约定.md)。** 那里记着已经付过学费的地方:哪些是铁律、哪些坑别再踩、以及这份文档要求你如何诚实更新它。
+
 ```text
 CodingAgent(opencode / Claude Code / Trae)
   → 适配器(opencode 插件 / claude-code bridge / jsonl watcher / Trae hook)
@@ -115,12 +117,38 @@ Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
 ```powershell
 md .trae
 copy adapters\trae-hook\hooks.sample.json .trae\hooks.json
-# 然后编辑 .trae\hooks.json,把 <替换为本仓库的绝对路径> 改成实际路径
+# 然后编辑 .trae\hooks.json,把 <仓库绝对路径…> 换成实际路径,保留后面的 \adapters\trae-hook\kvba-trae-hook.mjs
 ```
 
-`.trae/hooks.json` 是机器相关的本地配置(含绝对路径),已在 `.gitignore` 内,不会随仓库分发。脚本在 `PostToolUse` 读 `tool_name/tool_input/tool_response`、在 `Stop` 发 `turn.ended`,并把 Trae 的工具名映射成门控期望的规范小写名(`SearchReplace→edit`、`RunCommand→bash`、`Read→read` …);`RunCommand` 不算写事件,避免把跑命令误判成改代码。
+**三步必做,否则 hook 永不触发**(踩过的坑,别省):
 
-排查时设 `$env:KVBA_HOOK_DEBUG = "1"`,每次 hook 触发会往 stderr 打一行投递结果。
+1. Trae 菜单 **设置 → Hooks**,确认项目 Hook 已列出且处于**启用**状态(未启用就点创建/启用);
+2. **新开一个会话**再让 Agent 干活 —— Trae 只在创建 Session 时读取 hook 配置,当前会话内改文件不生效。
+3. **命令里的路径不能含空格,也不要给路径加引号。** Trae 会把 hook 命令交给 `trae-sandbox.exe exec --command-line <...>` 执行,命令串里的内层引号会**提前闭合外层引号**,于是路径在空格处被劈成两半,报 `error: unexpected argument 'more\KVBA\adapters\...' found`。此时 Hook 状态看着是"已启用",实际一次都没跑起来。
+
+   仓库放在带空格(或中文)的目录下时,改用 **8.3 短路径**,并且**不加引号**:
+
+   ```powershell
+   # 查短路径名:Scripting.FileSystemObject 的 ShortPath
+   (New-Object -ComObject Scripting.FileSystemObject).GetFolder("C:\Users\me\Desktop\GH more").ShortPath
+   # → C:\Users\me\Desktop\GHMORE~1
+   ```
+
+   ```json
+   { "type": "command", "command": "node C:\\Users\\me\\Desktop\\GHMORE~1\\KVBA\\adapters\\trae-hook\\kvba-trae-hook.mjs", "timeout": 10 }
+   ```
+
+   脚本本身只依赖 `node:fs`、端点从 `%APPDATA%\dev.kvba.app\endpoint.json` 读,所以拷到任何无空格目录(或经短路径访问)都能正常工作,`projectPath` 仍取 Trae 传入的 `cwd`。
+
+配置生效与否的判据:打开 KVBA 设置面板「运行状态 → 事件链路」,显示「本次运行 0 条」即未接入;显示条数在增长即已通。也可以先手工验证脚本本身:
+
+```powershell
+$env:KVBA_HOOK_DEBUG = "1"
+'{"hook_event_name":"Stop","session_id":"t","cwd":"'$PWD'"}' | node adapters\trae-hook\kvba-trae-hook.mjs
+# 期望 [kvba-hook] Stop → ok;→ fail/drop 说明 KVBA 没在跑或端点文件不对
+```
+
+`.trae/hooks.json` 是机器相关的本地配置(含绝对路径),已在 `.gitignore` 内,不会随仓库分发。脚本在 `PostToolUse` 读 `tool_name/tool_input/tool_response`、在 `Stop` 发 `turn.ended`,并把 Trae 的工具名映射成门控期望的规范小写名(`SearchReplace→edit`、`RunCommand→bash`、`Read→read` …);`RunCommand` 不算写事件,避免把跑命令误判成改代码。全局生效可改用 `%USERPROFILE%\.trae-cn\hooks.json`。
 
 ### 端点发现
 
@@ -157,10 +185,10 @@ copy adapters\trae-hook\hooks.sample.json .trae\hooks.json
 └────────────────────────────────────────────────────────────┘
 ```
 
-- **门控决策树**(`src-tauri/src/gate/`):G1 队列硬闸 → G2 频控/主题冷却 → G3 活性 → G4 分支路由 → G5 信号评分(阈值 60,P0 判定)→ G6 去重 → G7 才允许调用 LLM(单次 ≤5k token)。全部 0 token、纯函数、带 16 项夹具单测。面板内「决策日志」可看每次评估:Gx 层级、拒绝原因、耗时。
-- **记忆层**(`src-tauri/src/memory/`):项目级 facts(扫描 package.json/README/目录树,首版一次 LLM 生成,增量合并仅在消费 ≥20 或会话结束时)+ 对话滚动窗口(最近 3 条 ≤3KB,零 LLM)。
+- **门控决策树**(`src-tauri/src/gate/`):G1 队列硬闸 → G2 频控/主题冷却 → G3 活性 → G4 分支路由 → G5 信号评分(阈值 60,P0 判定)→ G6 去重 → G7 才允许调用 LLM(单次 ≤5k token)。全部 0 token、纯函数、带 17 项夹具单测。面板内「决策日志」可看每次评估:Gx 层级、拒绝原因、耗时。G6 用「分支 + 主题 + 卡片正文」出稿指纹,与攒批/入队护栏同一口径;手动「来一道」(force)豁免 G6。
+- **记忆层**(`src-tauri/src/memory/`):项目级 facts(扫描 package.json/README/目录树,首版一次 LLM 生成,增量合并仅在消费 ≥20 或会话结束时)+ 对话滚动窗口(最近 3 条 ≤3KB,零 LLM)。同项目 facts 生成期内只发一次,不逐条事件烧额度。
 - **加密存储**(`src-tauri/src/crypto/`):AES-256-GCM,密钥 = HKDF-SHA256(机器指纹,随机 salt);机器指纹:Windows MachineGuid / macOS IOPlatformUUID / Linux /etc/machine-id。不出现 MD5。
-- **防腐拒侵入**:适配器失败重试 3 次后丢弃,永不阻塞 Agent;胶囊 idle 态整窗点击穿透(悬停探测器条恢复交互);置顶从不抢焦点;胶囊可随时隐藏退化为托盘 + 系统通知兜底。
+- **防腐拒侵入**:适配器失败重试 3 次后丢弃,永不阻塞 Agent;胶囊圆点是 48×48 无边框透明置顶小窗(不进任务栏、从不抢焦点);胶囊可随时隐藏退化为托盘 + 系统通知兜底。
 
 ## 数据目录
 
@@ -177,6 +205,8 @@ copy adapters\trae-hook\hooks.sample.json .trae\hooks.json
 | `decision-log.jsonl` | 门控决策日志(滚动 200) |
 | `projects/<sha256(path)[..16]>/` | 每项目 `events.log`(JSONL 200 条)+ `facts.json`(≤50KB) |
 
+日志**不在**上面这个目录:`tauri-plugin-log` 默认同时写 stdout 与系统日志目录,打包运行时只写文件。Windows 在 `%LOCALAPPDATA%\dev.kvba.app\logs\KVBA.log`(macOS `~/Library/logs/dev.kvba.app/`,Linux `~/.local/share/dev.kvba.app/logs/`)。排查静默失败(如 facts 生成不落地)先看这个文件,不要只盯着 `tauri dev` 的终端。
+
 ## 目录结构
 
 ```text
@@ -186,7 +216,7 @@ adapters/
   claude-code/        Rust 桥:kvba-claude-bridge(stdin hook)+kvba-claude-watcher(jsonl)
   opencode-plugin/    TS 插件(kvba-plugin.ts)
   trae-hook/          Node 脚本适配器(kvba-trae-hook.mjs + hooks.sample.json)
-docs/                 规格与文档
+docs/                 规格与文档(改本仓库前必读 复盘与工程约定.md)
 ```
 
 ## 持续集成与发布
@@ -207,4 +237,6 @@ docs/                 规格与文档
 
 - Wayland 下透明/置顶依赖合成器,建议 X11 或 Windows/macOS。
 - 本地 HTTP 仅绑定 `127.0.0.1`,token 随机;密钥永不离开本机。
-- LLM 分析超时(180s)与重试(指数退避 ×2)后丢弃本次卡片,不影响后续批次。
+- LLM 分析超时(180s)与重试(指数退避 ×2)后丢弃本次卡片,不影响后续批次。一次分析最多只占一格当日额度(契约解析失败的严格重试不再重复计费)。
+- Claude Code 的 bridge(hook)与 watcher(JSONL 兜底)同开时,同一动作会被报两遍。事件 `id` 由各适配器自生成、两边不同,因此服务端按 **emitter 无关的内容指纹**(项目 + 事件类型 + 工具 + 意图 + 文件名 + 事件秒)在 5s 窗口内判重并静默 ACK。若两路边缘字段(如意图文本)不一致,仍可能漏判为两条事件——后果只是信号权重略高,不会丢数据。
+- `endpoint.json` 是适配器发现本地端点的唯一入口。端口/token 每次重启随机化,若该文件写入失败(权限/目录被删),适配器将无法配对而静默失效,而 KVBA 本体仍可用——此时看启动日志中的 `写入 ... 失败` 一行。**删除 `endpoint.json` 并重启 KVBA 即可重置配对**(后需重启各 Agent 会话让适配器重读)。

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 弹出面板:active(卡片横幅)/ popup(队列列表 ≤3 张)
 // 消费驱动:满意/不满意/自定义…/跳过/不再问这类;不满意 → 下一轮优化提示词(剪贴板 + .kvba/next-prompt.md)
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
@@ -89,8 +89,13 @@ async function submitCustom(card: Card) {
 }
 
 async function closePanel() {
+  // 收起后回到圆点 = idle;先上报再关窗,避免窗口隐藏后 IPC 排队丢失
+  await api.capsuleSetState("idle").catch(() => void 0);
   await api.panelClose().catch(() => void 0);
 }
+
+// 胶囊态上报(设置面板「运行状态」的读方):idle 由 closePanel 负责
+watch(mode, (m) => void api.capsuleSetState(m).catch(() => void 0), { immediate: true });
 
 function onHeaderPointerDown(e: PointerEvent) {
   // 按住标题栏空白处 → native 拖动窗口(排除按钮/退出是它们自己处理)
@@ -118,7 +123,7 @@ async function armAutoHide() {
     // 正在输入自定义答复时不收起,避免打断作答
     if (document.activeElement instanceof HTMLTextAreaElement) return;
     if (!document.hasFocus()) {
-      await api.panelClose().catch(() => void 0);
+      await closePanel();
     }
     hideTimer = null;
   }, 400);

@@ -314,6 +314,34 @@ pub fn protect_windows_from_close(app: &AppHandle) {
     }
 }
 
+/// 把窗口整块钳回最近显示器的工作区内(已完整可见则不动)
+fn clamp_window_into_view(win: &tauri::WebviewWindow) {
+    let Ok(pos) = win.outer_position() else {
+        return;
+    };
+    let Some(b) = window_box(win) else { return };
+    let areas = work_areas(&win.app_handle().clone());
+    let (x, y) = pick_dock(&areas, pos.x as i64, pos.y as i64, b.w, b.h);
+    if (x, y) != (pos.x as i64, pos.y as i64) {
+        // 纠正本身会再触发一次 Moved;此时坐标已合法 → 不再 set_position,自然收敛
+        let _ = win.set_position(PhysicalPosition::new(x as i32, y as i32));
+    }
+}
+
+/// 面板由原生 `startDragging` 拖动,不像圆点那样有 `dock_snap` 钳制,
+/// 且位置从不持久化 —— 一旦被拖到所有显示器之外就当场"消失"且无从拖回。
+pub fn keep_panel_on_screen(app: &AppHandle) {
+    let Some(panel) = panel_window(app) else {
+        return;
+    };
+    let target = panel.clone();
+    panel.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Moved(_)) {
+            clamp_window_into_view(&target);
+        }
+    });
+}
+
 /// 记录胶囊显隐意图(运行期标志 + 设置项);启动时始终复位为显示
 fn set_capsule_hidden(app: &AppHandle, hidden: bool) {
     let Some(state) = app.try_state::<Arc<AppState>>().map(|s| s.inner().clone()) else {
@@ -356,6 +384,20 @@ pub fn open_settings(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     }
+}
+
+/// 胶囊状态上报(前端状态机 idle/active/popup)。
+/// 只记录、不控制行为;读方是设置面板「运行状态」——排查"卡片进了队列却看不见"时先看这里。
+#[tauri::command]
+pub fn capsule_set_state(
+    state: tauri::State<'_, Arc<AppState>>,
+    capsule_state: String,
+) -> Result<(), String> {
+    if !matches!(capsule_state.as_str(), "idle" | "active" | "popup") {
+        return Err(format!("未知胶囊状态:{capsule_state}"));
+    }
+    state.core.blocking_lock().capsule_state = capsule_state;
+    Ok(())
 }
 
 /// 开/关面板(供前端调用);mode: active|popup
@@ -435,6 +477,16 @@ mod tests {
         let areas = [area(0, 0, 640, 480)];
         let (x, y) = pick_dock(&areas, 5000, 5000, 800, 800);
         assert_eq!((x, y), (0, 0));
+    }
+
+    /// 面板实测现场:物理 2560 宽屏上被拖到 (2131,377),516×678 的窗口右缘出界 87px
+    #[test]
+    fn partially_off_screen_window_is_pulled_fully_into_view() {
+        let areas = [area(0, 0, 2560, 1600)];
+        let (x, y) = pick_dock(&areas, 2131, 377, 516, 678);
+        assert_eq!((x, y), (2560 - 516, 377), "右缘出界应贴回右缘,纵向不动");
+        // 幂等:纠正后的位置再量一次必须已合法(否则 Moved 回调会来回抖动)
+        assert_eq!(pick_dock(&areas, x, y, 516, 678), (x, y));
     }
 
     #[test]

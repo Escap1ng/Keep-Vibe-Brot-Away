@@ -20,17 +20,23 @@ const KEEP_AWARENESS: usize = 20;
 /// 收缩后目录概览的最小保留字符数
 const DIR_SUMMARY_FLOOR: usize = 200;
 
+/// 项目记忆。字段全部可缺省(`default`)并兼容 snake_case 别名:
+/// LLM 少回一个字段或换了命名风格是常态,严格反序列化会让整份记忆静默丢失
+/// (卡片路径有模板兜底,记忆路径没有,一旦解析失败就再也立不起来)。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Facts {
     pub framework: String,
+    #[serde(alias = "tech_stack")]
     pub tech_stack: Vec<String>,
+    #[serde(alias = "dir_summary")]
     pub dir_summary: String,
+    #[serde(alias = "key_entry_points")]
     pub key_entry_points: Vec<String>,
     pub decisions: Vec<String>,
-    #[serde(default)]
+    #[serde(alias = "awareness_facts")]
     pub awareness_facts: Vec<String>,
-    #[serde(default)]
+    #[serde(alias = "generated_at")]
     pub generated_at: i64,
 }
 
@@ -192,14 +198,75 @@ fn publish_facts(state: &Arc<AppState>, pdir: &Path, project_path: &str, mut fac
     );
 }
 
+/// 启动时调用:为已恢复的活动项目补生成 facts(事件窗口已从 events.log 恢复,
+/// 但 Agent 若正闲置就再也不会触发 `kick_facts_if_needed`,记忆会一直空着)
+pub fn kick_facts_for_active(state: &Arc<AppState>) {
+    let path = {
+        let core = state.core.blocking_lock();
+        core.active_project
+            .as_ref()
+            .and_then(|key| core.projects.get(key))
+            .and_then(|live| live.events.back())
+            .map(|e| e.project_path.clone())
+    };
+    if let Some(p) = path {
+        kick_facts_if_needed(state, &p);
+    }
+}
+
+/// facts 取稿的输出上限。与卡片路径(`analyze_pass`)对齐到 800:
+/// 400 装不下 `dirSummary`(契约允许 ≤80 字中文)加两个数组,
+/// 模型常在闭合 `}` 之前就被截断 → `extract_json` 拿不到对象 → 整份记忆静默作废。
+const FACTS_MAX_OUTPUT_TOKENS: u32 = 800;
+/// 同一项目 facts 首版连续失败几次后开始冷却
+const FACTS_FAIL_LIMIT: u32 = 3;
+/// 冷却多久(秒)。事件是逐条进来的,没有这道闸门就会每条事件重跑一次注定失败的调用
+const FACTS_FAIL_COOLDOWN: i64 = 6 * 3600;
+
+/// facts 取稿:调用 → 解析;仅当"调用成功但解析失败"才更严格地重试一次。
+/// 首次调用计预算、重试不计预算,一次任务最多只吃一格当日额度(与 `analyze_pass` 同一口径)。
+/// **传输/预算错误一律 `?` 直接上抛**:重试通道是免预算的,若在这里也重试就等于把预算闸门绕穿。
+/// 错误串自带故障形态,日志能直接指出该提 token 还是该改契约。
+async fn facts_complete(state: &Arc<AppState>, system: &str, user: &str) -> Result<Facts, String> {
+    let text = crate::llm::chat_complete(state, system, user, FACTS_MAX_OUTPUT_TOKENS).await?;
+    if let Ok(facts) = crate::llm::parse_contract_facts(&text) {
+        return Ok(facts);
+    }
+    let strict_user = format!(
+        "{user}\n\n注意:只返回一个完整闭合的 JSON 对象,不要任何其他文字,也不要用 markdown 代码块包裹。"
+    );
+    let text2 =
+        crate::llm::chat_complete_unbudgeted(state, system, &strict_user, FACTS_MAX_OUTPUT_TOKENS)
+            .await?;
+    crate::llm::parse_contract_facts(&text2).map_err(|e| {
+        format!(
+            "两次均未拿到合法 JSON:{};{}",
+            e.as_str(),
+            crate::llm::text_probe(&text2)
+        )
+    })
+}
+
+/// 该失败是否值得计入冷却。预算耗尽不是"这条路径坏了",而是"现在没额度"——
+/// 记进冷却会让额度恢复后仍被挡 6 小时,反而把记忆永久饿死。
+fn is_budget_exceeded(err: &str) -> bool {
+    err.starts_with(crate::llm::budget::BUDGET_EXCEEDED_PREFIX)
+}
+
 /// 由摄入管线调用:新项目且无 facts → 调度异步生成首版(扫描 + 一次 LLM 调用)
 pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
     let project = project_path.to_string();
+    let key = crate::state::project_key(&project);
     {
         let core = state.core.blocking_lock();
-        let key = crate::state::project_key(&project);
         if let Some(live) = core.projects.get(&key) {
             if live.facts.is_some() {
+                return;
+            }
+        }
+        if let Some(&(fails, until)) = core.facts_fail.get(&key) {
+            if fails >= FACTS_FAIL_LIMIT && crate::state::now_ts() < until {
+                log::debug!("facts 首版已连败 {fails} 次,冷却中,跳过本项目");
                 return;
             }
         }
@@ -209,6 +276,17 @@ pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
     if let Some(facts) = load_facts(&pdir) {
         let mut core = state.core.blocking_lock();
         core.project_live(&project).facts = Some(facts);
+        core.facts_fail.remove(&key);
+        return;
+    }
+
+    // 同一项目只留一个在途任务:事件是逐条进来的,不去重就会每条事件各烧一次预算
+    if !state
+        .core
+        .blocking_lock()
+        .facts_inflight
+        .insert(key.clone())
+    {
         return;
     }
 
@@ -216,25 +294,38 @@ pub fn kick_facts_if_needed(state: &Arc<AppState>, project_path: &str) {
     tauri::async_runtime::spawn(async move {
         let snapshot = scan_project(std::path::Path::new(&project));
         let user = crate::llm::prompt::facts_v1_user(&crate::llm::fit_tokens(&snapshot, 2000));
-        match crate::llm::chat_complete(
+        match facts_complete(
             &state,
             "你是项目架构记录助手。按 JSON 契约输出,不要多余文字。",
             &user,
-            400,
         )
         .await
         {
-            Ok(text) => match crate::llm::parse_contract_facts(&text) {
-                Some(facts) => {
-                    let pdir = state.project_dir(&project);
-                    publish_facts(&state, &pdir, &project, facts);
+            Ok(facts) => {
+                let pdir = state.project_dir(&project);
+                publish_facts(&state, &pdir, &project, facts);
+                state.core.blocking_lock().facts_fail.remove(&key);
+                log::info!("facts 首版已生成:{project}");
+            }
+            Err(reason) => {
+                if is_budget_exceeded(&reason) {
+                    // 额度耗尽不计入连败:下一条事件仍应照常尝试,否则记忆会被饿死
+                    log::info!("facts 首版暂缓(今日预算已用尽):{reason}");
+                } else {
+                    let fails = {
+                        let mut core = state.core.blocking_lock();
+                        let next = core.facts_fail.get(&key).map(|(n, _)| n + 1).unwrap_or(1);
+                        core.facts_fail.insert(
+                            key.clone(),
+                            (next, crate::state::now_ts() + FACTS_FAIL_COOLDOWN),
+                        );
+                        next
+                    };
+                    log::warn!("facts 首版生成失败(累计 {fails} 次,{FACTS_FAIL_LIMIT} 次后冷却 {FACTS_FAIL_COOLDOWN}s):{reason}");
                 }
-                None => log::warn!("facts 首版返回不可解析的 JSON,已跳过"),
-            },
-            Err(e) => {
-                log::warn!("facts 首版生成失败(不影响主流程):{e}");
             }
         }
+        state.core.blocking_lock().facts_inflight.remove(&key);
     });
 }
 
@@ -267,21 +358,15 @@ pub fn merge_kick(
             &crate::llm::fit_tokens(&old_text, 1200),
             &crate::llm::fit_tokens(&signals, 1200),
         );
-        match crate::llm::chat_complete(
+        match facts_complete(
             &state,
             "你是项目记忆精炼助手。只返回 JSON,不要多余文字。",
             &user,
-            500,
         )
         .await
         {
-            Ok(text) => match crate::llm::parse_contract_facts(&text) {
-                Some(merged) => publish_facts(&state, &pdir, &project_path, merged),
-                None => log::warn!("facts 增量合并返回不可解析的 JSON,已跳过"),
-            },
-            Err(e) => {
-                log::warn!("facts 增量合并失败:{e}");
-            }
+            Ok(merged) => publish_facts(&state, &pdir, &project_path, merged),
+            Err(reason) => log::warn!("facts 增量合并失败:{reason}"),
         }
     });
 }
@@ -307,6 +392,34 @@ mod tests {
         let got = load_facts(&dir).unwrap();
         assert_eq!(got.framework, "Nuxt3");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LLM 常少回字段或改用 snake_case;严格反序列化会让整份记忆静默丢失
+    #[test]
+    fn deserialize_tolerates_missing_and_snake_case_fields() {
+        let f: Facts =
+            serde_json::from_str(r#"{"framework":"Next.js","tech_stack":["TypeScript"]}"#).unwrap();
+        assert_eq!(f.framework, "Next.js");
+        assert_eq!(f.tech_stack, vec!["TypeScript"]);
+        assert!(f.decisions.is_empty(), "缺字段应为空集合而非整体失败");
+        assert!(f.dir_summary.is_empty());
+
+        let g: Facts = serde_json::from_str(
+            r#"{"framework":"Vue3","keyEntryPoints":["src/main.ts"],"awareness_facts":["a"]}"#,
+        )
+        .unwrap();
+        assert_eq!(g.key_entry_points, vec!["src/main.ts"]);
+        assert_eq!(g.awareness_facts, vec!["a"]);
+    }
+
+    /// 契约里的 5 个字段全给时必须一字不丢(别名不能破坏正路)
+    #[test]
+    fn deserialize_keeps_full_camel_case_payload() {
+        let raw = r#"{"framework":"Tauri","techStack":["Rust","Vue"],"dirSummary":"src/ …","keyEntryPoints":["src/lib.rs"],"decisions":["用 axum 做本地摄入"],"awarenessFacts":["用户回答(知情度):Tauri"],"generatedAt":123}"#;
+        let f: Facts = serde_json::from_str(raw).unwrap();
+        assert_eq!(f.tech_stack, vec!["Rust", "Vue"]);
+        assert_eq!(f.dir_summary, "src/ …");
+        assert_eq!(f.generated_at, 123);
     }
 
     #[test]

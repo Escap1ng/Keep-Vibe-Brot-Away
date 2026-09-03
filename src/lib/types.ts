@@ -69,10 +69,16 @@ export interface EndpointInfo {
   eventToken: string;
 }
 
+/** 胶囊前端状态机(与 Rust Core.capsule_state 取值一致) */
+export type CapsuleState = "idle" | "active" | "popup";
+
 /** 运行统计(§1.5 成功度量本地埋点):当日计数 + 历史累计 */
 export interface StatsInfo {
   lastEventIn: number | null;
+  /** 本次进程累计摄入事件数:区分"链路通了但 Agent 闲置"与"一条都没进来" */
+  eventsIngested: number;
   activeProject: string;
+  capsuleState: CapsuleState;
   cardsCreated: number;
   answers: number;
   unsatisfied: number;
