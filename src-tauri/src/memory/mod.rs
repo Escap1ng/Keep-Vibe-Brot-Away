@@ -214,10 +214,6 @@ pub fn kick_facts_for_active(state: &Arc<AppState>) {
     }
 }
 
-/// facts 取稿的输出上限。与卡片路径(`analyze_pass`)对齐到 800:
-/// 400 装不下 `dirSummary`(契约允许 ≤80 字中文)加两个数组,
-/// 模型常在闭合 `}` 之前就被截断 → `extract_json` 拿不到对象 → 整份记忆静默作废。
-const FACTS_MAX_OUTPUT_TOKENS: u32 = 800;
 /// 同一项目 facts 首版连续失败几次后开始冷却
 const FACTS_FAIL_LIMIT: u32 = 3;
 /// 冷却多久(秒)。事件是逐条进来的,没有这道闸门就会每条事件重跑一次注定失败的调用
@@ -226,18 +222,26 @@ const FACTS_FAIL_COOLDOWN: i64 = 6 * 3600;
 /// facts 取稿:调用 → 解析;仅当"调用成功但解析失败"才更严格地重试一次。
 /// 首次调用计预算、重试不计预算,一次任务最多只吃一格当日额度(与 `analyze_pass` 同一口径)。
 /// **传输/预算错误一律 `?` 直接上抛**:重试通道是免预算的,若在这里也重试就等于把预算闸门绕穿。
-/// 错误串自带故障形态,日志能直接指出该提 token 还是该改契约。
+/// 错误串自带故障形态,日志能直接指出是丢数据还是改契约。
+///
+/// 输出上限一律走 `crate::llm::MAX_OUTPUT_TOKENS`,**这里不要再留本地数字** ——
+/// 上一轮 facts=400 / 卡片=800 的漂移正是我误判根因的起点。
 async fn facts_complete(state: &Arc<AppState>, system: &str, user: &str) -> Result<Facts, String> {
-    let text = crate::llm::chat_complete(state, system, user, FACTS_MAX_OUTPUT_TOKENS).await?;
+    let text =
+        crate::llm::chat_complete(state, system, user, crate::llm::MAX_OUTPUT_TOKENS).await?;
     if let Ok(facts) = crate::llm::parse_contract_facts(&text) {
         return Ok(facts);
     }
     let strict_user = format!(
         "{user}\n\n注意:只返回一个完整闭合的 JSON 对象,不要任何其他文字,也不要用 markdown 代码块包裹。"
     );
-    let text2 =
-        crate::llm::chat_complete_unbudgeted(state, system, &strict_user, FACTS_MAX_OUTPUT_TOKENS)
-            .await?;
+    let text2 = crate::llm::chat_complete_unbudgeted(
+        state,
+        system,
+        &strict_user,
+        crate::llm::MAX_OUTPUT_TOKENS,
+    )
+    .await?;
     crate::llm::parse_contract_facts(&text2).map_err(|e| {
         format!(
             "两次均未拿到合法 JSON:{};{}",

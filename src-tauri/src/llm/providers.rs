@@ -13,8 +13,15 @@ pub type BoxTextStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Sen
 pub struct ChatRequest {
     pub system: String,
     pub user: String,
-    pub max_output_tokens: u32,
+    /// `None` = **不下发 max_tokens**,由 provider 用它自己的上限。
+    /// 契约答案只有几百 token,任何手写的数字都只是在制造「到底够不够大」这种猜疑;
+    /// 而写大了会撞上各家硬上限换来一个 400,写小了就是上一轮那种静默截断。
+    pub max_output_tokens: Option<u32>,
 }
+
+/// Anthropic 的 `/v1/messages` **强制要求** `max_tokens`,不给默认值就没法省略。
+/// 取一个远高于任何契约答案、又不会超出各家上限的数。
+const ANTHROPIC_REQUIRED_MAX: u32 = 8192;
 
 /// 统一入口:发流式请求,返回 SSE 文本增量流
 pub async fn stream_chat(
@@ -57,8 +64,10 @@ async fn stream_openai(
         "model": model,
         "messages": user_messages(req),
         "stream": true,
-        "max_tokens": req.max_output_tokens,
     });
+    if let Some(n) = req.max_output_tokens {
+        body["max_tokens"] = json!(n);
+    }
     // DeepSeek V4 默认开启思考模式:输出预算会先被 reasoning_content 吃掉,而本解析器
     // 只读 delta.content → 聚合为空 → 判定「LLM 分析失败」。对 DeepSeek 端点显式禁用思考。
     if base.to_lowercase().contains("deepseek") {
@@ -114,11 +123,14 @@ async fn stream_google(
         .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
     let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}");
 
-    let body = json!({
+    let mut body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": req.user }] }],
         "systemInstruction": { "parts": [{ "text": req.system }] },
-        "generationConfig": { "max_output_tokens": req.max_output_tokens }
+        "generationConfig": {}
     });
+    if let Some(n) = req.max_output_tokens {
+        body["generationConfig"]["max_output_tokens"] = json!(n);
+    }
 
     let resp = client
         .post(&url)
@@ -170,7 +182,8 @@ async fn stream_anthropic(
 
     let body = json!({
         "model": model,
-        "max_tokens": req.max_output_tokens,
+        // 这一家的 API 强制要 max_tokens,不能省略 → 用一个远高于契约需求的默认值
+        "max_tokens": req.max_output_tokens.unwrap_or(ANTHROPIC_REQUIRED_MAX),
         "system": req.system,
         "messages": [{ "role": "user", "content": req.user }],
         "stream": true

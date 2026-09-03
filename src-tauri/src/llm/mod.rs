@@ -153,12 +153,27 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// 所有 LLM 调用的输出上限,全仓唯一取值点。`None` = **不下发 max_tokens**,
+/// 由 provider 用它自己的最大值。
+///
+/// 为什么不再写数字:
+/// - 契约答案本身就小(卡片 `text ≤120 字`、facts 五个小字段,真实产出约 300–600 token),
+///   任何手写的上限都只是在制造「到底够不够大」这种猜疑;
+/// - 写大了会撞上各家硬上限换来一个 400,写小了就是上一轮那种**静默截断**;
+/// - 上一轮真正烧掉我三小时的,正是 facts 用 400、卡片用 800 这种「同一契约两条路径
+///   两个上限」的漂移。**宁可一个 None,也不再留两个数。**
+///
+/// 注意这不放松成本:规格里「单次分析强制 ≤5000 token」约束的是**实际消耗**,
+/// 而实际消耗由输入侧决定 —— `system` 约 0.6k、`user` 经 `fit_tokens` 裁到 ≤3.5k,
+/// 这两处裁剪一行都没动。输出侧另有 `text > 120 字` 的硬截断兜底。
+pub const MAX_OUTPUT_TOKENS: Option<u32> = None;
+
 /// 通用流式对话:聚合全部文本并返回(**计入一格当日预算**)
 pub async fn chat_complete(
     state: &Arc<AppState>,
     system: &str,
     user: &str,
-    max_output_tokens: u32,
+    max_output_tokens: Option<u32>,
 ) -> Result<String, String> {
     let cfg = config_checked(state)?;
     if let Err(budget::BudgetErr::Exceeded) = budget::check_then_inc(state) {
@@ -178,7 +193,7 @@ pub async fn chat_complete_unbudgeted(
     state: &Arc<AppState>,
     system: &str,
     user: &str,
-    max_output_tokens: u32,
+    max_output_tokens: Option<u32>,
 ) -> Result<String, String> {
     let cfg = config_checked(state)?;
     stream_text(&cfg, system, user, max_output_tokens).await
@@ -189,7 +204,7 @@ async fn stream_text(
     cfg: &(String, String, Option<String>, String),
     system: &str,
     user: &str,
-    max_output_tokens: u32,
+    max_output_tokens: Option<u32>,
 ) -> Result<String, String> {
     let (provider, model, base_url, key) = cfg;
     let req = providers::ChatRequest {
@@ -268,10 +283,11 @@ pub fn parse_contract(text: &str) -> Option<AnalysisOut> {
 }
 
 /// facts 解析失败的**形态**。两种故障的修法完全相反,压成一个 `None` 就只能靠猜:
-/// `Unclosed` 要提 `max_output_tokens`,`Shape` 要改契约或放宽结构体。
+/// `Unclosed` 查流式解析/模型未写完,`Shape` 改契约或放宽结构体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactsParseErr {
-    /// 扫不到配对的 `}` —— 几乎总是输出被 max_output_tokens 截断
+    /// 扫不到配对的 `}` —— 输出**不完整**。既然已不再下发 `max_tokens`,
+    /// 这一态就只剩两种解释:流式解析丢了尾部数据,或模型自己没写完。
     Unclosed,
     /// JSON 完整,但字段类型与契约不符(带 serde 原文)
     Shape(String),
@@ -280,7 +296,7 @@ pub enum FactsParseErr {
 impl FactsParseErr {
     pub fn as_str(&self) -> String {
         match self {
-            Self::Unclosed => "扫不到闭合的 `}`(输出被 max_output_tokens 截断)".into(),
+            Self::Unclosed => "扫不到闭合的 `}`(输出不完整:流解析丢数据,或模型未写完)".into(),
             Self::Shape(m) => format!("JSON 完整但契约不符:{m}"),
         }
     }
@@ -323,8 +339,8 @@ pub async fn analyze_pass_for_project(
 
     let system = prompt::system_role();
     let user = prompt::build_analysis_user(&snapshot);
-    // 预算:system 0.6k + user ≤3.5k(逐字段裁剪) + 输出 0.8k → 单次总 ≤5k
-    let text = chat_complete(state, &system, &user, 800).await?;
+    // 预算:system 0.6k + user ≤3.5k(逐字段裁剪)决定实际消耗;输出不下发上限
+    let text = chat_complete(state, &system, &user, MAX_OUTPUT_TOKENS).await?;
 
     if let Some(out) = parse_contract(&text) {
         return Ok(normalize_out(out, pass, &snapshot, true));
@@ -334,7 +350,7 @@ pub async fn analyze_pass_for_project(
     let strict = format!(
         "{user}\n\n注意:请只返回一个 JSON 对象,不要包含任何其他文字、不要用 markdown 代码块包裹。"
     );
-    let text2 = chat_complete_unbudgeted(state, &system, &strict, 800).await?;
+    let text2 = chat_complete_unbudgeted(state, &system, &strict, MAX_OUTPUT_TOKENS).await?;
     if let Some(out) = parse_contract(&text2) {
         return Ok(normalize_out(out, pass, &snapshot, true));
     }
@@ -493,7 +509,7 @@ pub async fn llm_test_connection(
     let req = providers::ChatRequest {
         system: "你是回声机".into(),
         user: "只回复两个字母:OK".into(),
-        max_output_tokens: 8,
+        max_output_tokens: Some(8),
     };
     let mut stream =
         providers::stream_chat(&client, &provider, &model, base.as_deref(), &key, &req)
@@ -545,6 +561,17 @@ mod tests {
         let text = "好的:\n```json\n{\"type\":\"tips\",\"severity\":\"info\",\"theme\":\"vue-lifecycle\",\"text\":\"贴士正文\"}\n```";
         let out = parse_contract(text).expect("代码块包裹的 JSON 应可解析");
         assert_eq!(out.theme, "vue-lifecycle");
+    }
+
+    /// 锁死「不下发输出上限」这个决定。
+    /// 上一轮 facts=400 / 卡片=800 两个数字的漂移让我把相关性误判成因果、白烧三小时;
+    /// 改成 None 之后,任何"顺手加个上限"的回归都会在这里被拦下。
+    #[test]
+    fn output_cap_is_left_to_the_provider_not_a_local_number() {
+        assert!(
+            MAX_OUTPUT_TOKENS.is_none(),
+            "输出上限必须由 provider 决定;要改也请改 MAX_OUTPUT_TOKENS 这一处,不要回到各调用点各写一个数"
+        );
     }
 
     /// 截断与类型不符的修法完全相反(提 max_tokens vs 改契约),
