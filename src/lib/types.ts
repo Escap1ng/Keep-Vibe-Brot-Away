@@ -82,12 +82,18 @@ export interface StatsInfo {
   cardsCreated: number;
   answers: number;
   unsatisfied: number;
+  /** 当日真由 LLM 出的稿数。cardsCreated 与它不等,就说明有卡片其实来自模板兜底 */
+  cardsLlm: number;
+  /** 当日退用模板兜底的稿数:持续走高 = 契约或传输坏了,而界面上一切"正常" */
+  cardsTemplate: number;
   todayAnswerRate: number;
   total: {
     cardsCreated: number;
     answers: number;
     unsatisfied: number;
     answerRate: number;
+    cardsLlm: number;
+    cardsTemplate: number;
   };
   batched: number;
 }

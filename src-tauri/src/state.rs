@@ -195,6 +195,18 @@ pub struct Stats {
     pub total_cards_created: u64,
     pub total_answers: u64,
     pub total_unsatisfied: u64,
+    /// 正文真由 LLM 出的卡数。与 `cards_created` 分开记,是因为解析失败会静默
+    /// 回填模板文案并照样入队 —— 只记后者的话,「今日发卡 N 张」这张绿灯
+    /// 在 LLM 全挂的情况下依然会正常计数(实测 5 张里 4 张是模板)。
+    #[serde(default)]
+    pub cards_llm: u64,
+    /// 退用模板兜底的卡数。持续走高 = 契约或传输坏了,而界面上一切"正常"
+    #[serde(default)]
+    pub cards_template: u64,
+    #[serde(default)]
+    pub total_cards_llm: u64,
+    #[serde(default)]
+    pub total_cards_template: u64,
 }
 
 impl Stats {
@@ -207,6 +219,10 @@ impl Stats {
             total_cards_created: 0,
             total_answers: 0,
             total_unsatisfied: 0,
+            cards_llm: 0,
+            cards_template: 0,
+            total_cards_llm: 0,
+            total_cards_template: 0,
         }
     }
 
@@ -217,9 +233,13 @@ impl Stats {
             self.total_cards_created += self.cards_created;
             self.total_answers += self.answers;
             self.total_unsatisfied += self.unsatisfied;
+            self.total_cards_llm += self.cards_llm;
+            self.total_cards_template += self.cards_template;
             self.cards_created = 0;
             self.answers = 0;
             self.unsatisfied = 0;
+            self.cards_llm = 0;
+            self.cards_template = 0;
             self.date = today;
         }
     }
@@ -517,6 +537,9 @@ pub struct StatsTotals {
     pub answers: u64,
     pub unsatisfied: u64,
     pub answer_rate: f64,
+    /// 累计里真由 LLM 出的稿数(与 cardsCreated 不等即说明有卡片走了模板兜底)
+    pub cards_llm: u64,
+    pub cards_template: u64,
 }
 
 /// `stats_info` 的响应契约(与前端 lib/types.ts 的 StatsInfo 一一对应)
@@ -532,6 +555,10 @@ pub struct StatsInfo {
     pub cards_created: u64,
     pub answers: u64,
     pub unsatisfied: u64,
+    /// 当日 LLM 出稿 / 模板兜底 的分账。卡片数相同,含义完全不同:
+    /// 前者说明闭环在工作,后者说明契约或传输坏了而界面上一切"正常"
+    pub cards_llm: u64,
+    pub cards_template: u64,
     pub today_answer_rate: f64,
     pub total: StatsTotals,
     pub batched: usize,
@@ -576,12 +603,16 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
         cards_created: s.cards_created,
         answers: s.answers,
         unsatisfied: s.unsatisfied,
+        cards_llm: s.cards_llm,
+        cards_template: s.cards_template,
         today_answer_rate: answer_rate(s.answers, s.cards_created),
         total: StatsTotals {
             cards_created: s.total_cards_created,
             answers: s.total_answers,
             unsatisfied: s.total_unsatisfied,
             answer_rate: answer_rate(s.total_answers, s.total_cards_created),
+            cards_llm: s.total_cards_llm,
+            cards_template: s.total_cards_template,
         },
         batched: core.pending_batch.len(),
     }

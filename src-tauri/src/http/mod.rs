@@ -291,11 +291,23 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         crate::llm::AnalysisOut::fallback(&pass, &snapshot.project_path)
     };
 
+    // 出稿来源要在入队前取走:analysis 会被 move 进 push_pass_card。
+    // 不记这一位,「G7 pass=true 卡片生成并入队」对 LLM 出稿和模板兜底完全同词,
+    // 绿灯永远无法证伪 —— 实测曾有 5 张卡里 4 张是模板原文而无人察觉。
+    let from_llm = analysis.from_llm;
     let queued =
         crate::queue::push_pass_card(&state.app, &state, &pass, analysis, snapshot.last_event_id);
     // 三种结局必须分开陈述:混成"队列已满或同主题重复"会把人引向错误的自救动作
     let (log_reason, level, user_reason) = match queued {
-        crate::queue::InsertOutcome::Inserted => ("卡片生成并入队", "G7", String::new()),
+        crate::queue::InsertOutcome::Inserted => (
+            if from_llm {
+                "卡片生成并入队(LLM 出稿)"
+            } else {
+                "卡片生成并入队(模板兜底,LLM 未出稿)"
+            },
+            "G7",
+            String::new(),
+        ),
         crate::queue::InsertOutcome::QueueFull => (
             "入队被拒:队列已满(pending=3)",
             "G1",
