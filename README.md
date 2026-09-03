@@ -10,7 +10,7 @@ KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相
 
 ## 目录
 
-- [安装](#安装)：环境要求 / 启动 / 配置 LLM / 三种 Agent 联动 / 端点发现
+- [安装](#安装)：环境要求 / 启动 / 配置 LLM / 四种 Agent 联动 / 端点发现
 - [使用方式(产品循环)](#使用方式产品循环)
 - [架构](#架构)
 - [数据目录](#数据目录)
@@ -88,6 +88,37 @@ copy adapters\opencode-plugin\kvba-plugin.ts .opencode\plugins\kvba-plugin.ts
 
 ### 与 Claude Code 联动
 
+两种接法任选其一,可同时开(同报由服务端 5s 内容指纹判重兜底)。
+
+**接法 A:Node 钩子(零编译,推荐)**
+
+```powershell
+# 全局生效:把 hooks.sample.json 的 hooks 块合入 %USERPROFILE%\.claude\settings.json
+# 单项目生效:合入 <项目>\.claude\settings.json
+```
+
+示例片段(必须**新开会话**才生效;`matcher` 用 `"*"` 而不是枚举工具名,枚举表会漏掉 MultiEdit/WebFetch 等):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/adapters/claude-code-hook/kvba-claude-hook.mjs\"", "timeout": 3, "async": true } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/adapters/claude-code-hook/kvba-claude-hook.mjs\"", "timeout": 3, "async": true } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/adapters/claude-code-hook/kvba-claude-hook.mjs\"", "timeout": 3, "async": true } ] }
+    ]
+  }
+}
+```
+
+脚本装在仓库外时,把 `$CLAUDE_PROJECT_DIR/...` 换成绝对路径。完整配置见 [adapters/claude-code-hook/hooks.sample.json](adapters/claude-code-hook/hooks.sample.json),覆盖 UserPromptSubmit / PostToolUse / Stop / SubagentStop / SessionEnd 五类事件。
+
+**接法 B:Rust 桥(需编译)**
+
 ```bash
 cd adapters\claude-code
 cargo build --release
@@ -123,6 +154,30 @@ cargo build --release
 
 ```powershell
 Start-Process -WindowStyle Hidden <kvba-claude-watcher.exe>
+```
+
+### 与 Codex 联动
+
+零编译,一行配置:把下面这行**原样追加到 `%USERPROFILE%\.codex\config.toml` 的顶层**(路径换成实际绝对路径),重启 Codex 会话生效:
+
+```toml
+notify = ["node", "C:\\Users\\me\\KVBA\\adapters\\codex-notify\\kvba-codex-hook.mjs"]
+```
+
+三条会静默吃掉配置的坑(详见 [adapters/codex-notify/config.sample.toml](adapters/codex-notify/config.sample.toml)):
+
+1. `notify` 必须是**顶层键**——粘在 `[tui]` 等段落下面会变成 `[tui].notify`,完全无效且无报错;
+2. 不要加引号、不要写 shell 语法——Codex 直接把 argv 交给 exec,不经过 shell(`~`、`$HOME` 不展开;路径带空格也不需要引号);
+3. `node` 必须在 Codex 所在环境的 PATH 里(GUI 启动时未必继承 shell 的 PATH,拿不准就写绝对路径)。
+
+能力边界:Codex 目前只有 `agent-turn-complete` 一种 notify 事件,这一路只能产出 `turn.ended` → 知识分支(贴士/破冰/知情度卡);**审查卡需要写事件,Codex 这一路拿不到**,想要审查卡请用 Claude Code 或 Trae。
+
+手工自证(不经 Codex 包装层):
+
+```powershell
+$env:KVBA_HOOK_DEBUG = "1"
+node adapters\codex-notify\kvba-codex-hook.mjs '{"type":"agent-turn-complete","thread-id":"t1","turn-id":"1","cwd":"'$PWD'","last-assistant-message":"改完 src/lib/api.ts"}'
+# 期望 [kvba-hook] codex agent-turn-complete → ok;→ fail/drop 说明 KVBA 没在跑或 endpoint.json 不对
 ```
 
 ### 与 Trae 联动
@@ -266,4 +321,3 @@ docs/                 规格与文档(改本仓库前必读 复盘与工程约�
 | [docs/HANDOVER.md](docs/HANDOVER.md) | 项目交接报告:全貌速览、模块地图、已知问题清单、清理记录 | 新协作者入门第一站 |
 | [docs/复盘与工程约定.md](docs/复盘与工程约定.md) | 六轮复盘、铁律、缺陷现场证据、出稿判读表 | **改本仓库前必读** |
 | [docs/InitPrompt.md](docs/InitPrompt.md) | 原始技术规格书:问题定义、架构、门控树、里程碑 | 理解设计意图与取舍 |
-| [docs/codebase-research.md](docs/codebase-research.md) | 代码库研究报告与规格-实现对账(2026-09-03) | 核对规格与代码差异 |

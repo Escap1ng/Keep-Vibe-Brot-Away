@@ -191,25 +191,36 @@ function normalize(hook) {
 }
 
 async function main() {
+  const dbg = process.env.KVBA_HOOK_DEBUG ? console.error : () => {};
   let raw = "";
   try {
     raw = readFileSync(0, "utf8"); // 读 stdin(TraeCode 传入的 hook JSON)
   } catch {
+    dbg("[kvba-hook] trae skip/no-stdin");
     process.exit(0);
   }
-  const ep = readEndpoint();
-  if (!ep) process.exit(0); // KVBA 未运行 → 静默待命
   let hook;
   try {
     hook = JSON.parse(raw);
   } catch {
+    dbg("[kvba-hook] trae skip/bad-json");
     process.exit(0);
   }
   const ev = normalize(hook);
-  const ok = ev ? await postEvent(ep, ev) : false;
-  if (process.env.KVBA_HOOK_DEBUG) {
-    console.error(`[kvba-hook] ${hook.hook_event_name} → ${ok ? "ok" : "fail/drop"}`);
+  if (!ev) {
+    // 「脚本没把这事件映射成任何事」与「KVBA 没在跑」修法完全相反,
+    // 旧实现把两者连同上报失败一起压成 fail/drop —— 那是个无法证伪的二值诊断。
+    dbg(`[kvba-hook] trae skip/unrecognized(event=${hook.hook_event_name ?? "?"})`);
+    process.exit(0);
   }
+  dbg(`[kvba-hook] trae normalized ${JSON.stringify(ev)}`);
+  const ep = readEndpoint();
+  if (!ep) {
+    dbg("[kvba-hook] trae skip/no-endpoint(KVBA 未运行或 endpoint.json 不对)");
+    process.exit(0); // KVBA 未运行 → 静默待命
+  }
+  const ok = await postEvent(ep, ev);
+  dbg(`[kvba-hook] trae ${hook.hook_event_name} → ${ok ? "ok" : "fail/post"}`);
   process.exit(0); // 永远 0:绝不阻断 Trae
 }
 

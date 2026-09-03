@@ -12,7 +12,7 @@
 ## 2. 架构设计
 
 ```
-CodingAgent 环境（Claude Code hooks/JSONL watcher、opencode 插件、Trae hooks）
+CodingAgent 环境（Claude Code hooks/Node 钩子/JSONL watcher、opencode 插件、Trae hooks、Codex notify）
         │  统一「归一化事件」→ POST http://127.0.0.1:<随机端口>/kvba/events
         │  （握手 token 鉴权，仅本机回环）
         ▼
@@ -64,6 +64,7 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 
 - 里程碑主体完成：事件摄入、队列、七层门控、记忆层、LLM 出稿、加密存储、胶囊 UI、三平台 CI/发布流水线均已落地，全库 70 项单测绿。
 - 节奏参数已于 2026-09-03 按实测放宽（频控 25s、主题冷却 10min、去重窗口 20min），并新增开场破冰。
+- 适配器矩阵已扩至四种宿主（opencode / Claude Code×2 / Trae / Codex），Node 钩子均零编译、静默失败、重试 3 次后丢弃。
 - **端到端 LLM 出稿尚未最终验证闭环**（详见 §7）。
 
 ## 7. 已知问题及解决方案
@@ -85,7 +86,6 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 | [README.md](../README.md) | 安装运行、三 Agent 联动配置、端点发现、数据目录说明 |
 | [docs/InitPrompt.md](InitPrompt.md) | 原始技术规格书：问题定义、架构、门控树、里程碑、待决事项 |
 | [docs/复盘与工程约定.md](复盘与工程约定.md) | 六轮复盘、铁律、缺陷现场证据、判读表（**必读**） |
-| [docs/codebase-research.md](codebase-research.md) | 代码库研究报告与逐条对账（2026-09-03） |
 | [docs/HANDOVER.md](HANDOVER.md) | 本交接报告 |
 | `.github/workflows/` | ci.yml / release.yml |
 
@@ -97,6 +97,7 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 |---|---|---|---|
 | `adapters/claude-code/target/` | 564 MB | Rust 构建产物，已被 .gitignore 忽略，纯可再生 | `cargo build`（在 adapters/claude-code 下） |
 | `dist/` | 0.1 MB | Vite 前端构建产物，已被 .gitignore 忽略 | `npm run build` |
+| `docs/codebase-research.md` | 0.03 MB | 一次性研究报告，结论已沉淀进本报告与复盘文档，避免双份维护过期 | git 历史（`git log -- '*codebase-research*'`） |
 
 **甄别后保留（非冗余）**：
 - `node_modules/`（132 MB）：开发必需，未删除。

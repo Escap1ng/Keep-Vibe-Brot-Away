@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kvba_adapters::common::{build_event, collect_files, scan_flags, EventSpec};
+use kvba_adapters::common::{build_event, collect_files, longest_str, map_tool, scan_flags, EventSpec};
 use kvba_adapters::post_event;
 
 fn main() {
@@ -123,8 +123,15 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
     };
     for part in content {
         if part["type"] == "tool_use" {
-            let tool_name = part["name"].as_str().unwrap_or("").to_string();
+            // 转录里的工具名同样是首字母大写("Edit"),必须与 bridge 用同一个归一化函数:
+            // 服务端跨 emitter 的内容判重键里含 tool,两边不一致就会双报且信号权重翻倍。
+            let raw_name = part["name"].as_str().unwrap_or("").to_string();
+            let tool_name = map_tool(&raw_name);
             if tool_name.is_empty() {
+                continue;
+            }
+            if tool_name == "task" {
+                // 与 bridge 同口径:子任务事件与主 Agent 语义重复,丢弃
                 continue;
             }
             let input = part["input"].clone();
@@ -141,15 +148,20 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
                     .unwrap_or_default();
             }
             if intent.is_empty() {
-                intent = format!("执行 {tool_name}");
+                intent = format!("执行 {raw_name}");
             }
-            let mut diff = String::new();
-            for key in ["diff", "patch", "content"] {
-                if let Some(s) = input[key].as_str() {
-                    if s.len() > diff.len() {
-                        diff = s.to_string();
-                    }
-                }
+            let mut diff = longest_str(
+                &input,
+                &["diff", "patch", "content", "new_string", "newString", "replacement"],
+            );
+            if diff.is_empty() && input["edits"].is_array() {
+                diff = input["edits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| longest_str(e, &["new_string", "newString", "replacement"]))
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             let flags = scan_flags(&intent, &diff);
             let ev = build_event(EventSpec {
@@ -160,7 +172,11 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
                 diff_head: &diff,
                 intent: &intent,
                 flags,
-                line_delta: diff.lines().count() as i64,
+                line_delta: if tool_name == "bash" {
+                    0
+                } else {
+                    diff.lines().count() as i64
+                },
                 project_path: &cwd,
                 session_id: &session_id,
             });

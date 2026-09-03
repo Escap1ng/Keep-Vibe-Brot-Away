@@ -27,7 +27,26 @@ pub fn scan_flags(intent: &str, diff: &str) -> SeverityFlags {
     }
 }
 
-/// 从 tool_input 中收集受影响文件(`file_path` 单值 + `file_paths` 列表)
+/// 取 `keys` 中**最长**的字符串字段(内容/差异常分散在多个字段,最长的最接近正文)。
+///
+/// 两侧命名都得列:Claude Code 用 snake_case(`new_string`),Trae 用 camelCase
+/// (`newString`)。旧实现只查 camelCase,于是对 Claude 的 Edit 永远取不到 diff
+/// —— `lineDelta` 恒为 0,G5-A 的"大改 +30"这一路直接哑掉。
+pub fn longest_str(v: &Value, keys: &[&str]) -> String {
+    let mut best = String::new();
+    if let Some(obj) = v.as_object() {
+        for k in keys {
+            if let Some(s) = obj.get(*k).and_then(|x| x.as_str()) {
+                if s.len() > best.len() {
+                    best = s.to_string();
+                }
+            }
+        }
+    }
+    best
+}
+
+/// 从 tool_input 收集受影响文件(`file_path` 单值 + `file_paths` 列表 + MultiEdit 的 edits 数组)
 pub fn collect_files(input: &Value) -> Vec<String> {
     let mut files = Vec::new();
     if let Some(p) = input["file_path"].as_str() {
@@ -36,7 +55,45 @@ pub fn collect_files(input: &Value) -> Vec<String> {
     if let Some(list) = input["file_paths"].as_array() {
         files.extend(list.iter().filter_map(|p| p.as_str().map(str::to_string)));
     }
+    // MultiEdit 的文件藏在 edits 数组里,不看这一路就等于"改了但没留下文件名"
+    if let Some(edits) = input["edits"].as_array() {
+        for e in edits {
+            for key in ["file_path", "filePath"] {
+                if let Some(p) = e[key].as_str() {
+                    files.push(p.to_string());
+                }
+            }
+        }
+    }
+    // 按**首次出现顺序**去重。不能排序:`excerpt.files` 的第一个元素参与 G6 主题级指纹,
+    // 排序会让两个适配器(bridge / node hook)对同一动作给出不同的"首个文件",
+    // 跨 emitter 的内容判重随之失效。
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|f| seen.insert(f.clone()));
     files
+}
+
+/// Claude Code 的工具名是首字母大写的,而门控的 `is_write_event` 只认规范小写名
+/// (`edit` / `write` / `patch`)。**不归一化 = 这一路永远产不出审查卡。**
+///
+/// 这正是本 bridge 的旧缺陷:它把 `Edit` 原样上报,于是 `matches!("edit"|…)` 恒不成立,
+/// Claude Code 用户只能拿到知识卡,拿不到审查卡 —— 而且现象是"应用一切正常",无从察觉。
+pub fn map_tool(name: &str) -> String {
+    let mapped = match name {
+        "Write" => "write",
+        "Edit" | "MultiEdit" | "NotebookEdit" => "edit",
+        "Bash" => "bash",
+        "Read" => "read",
+        "Glob" => "glob",
+        "Grep" => "grep",
+        "Task" => "task",
+        "WebFetch" => "webfetch",
+        "WebSearch" => "websearch",
+        "SlashCommand" => "slash",
+        // MCP 工具形如 mcp__github__create_issue,以及未知工具:整串小写保留
+        _ => return name.to_lowercase(),
+    };
+    mapped.to_string()
 }
 
 /// 构造归一化事件所需的字段集合(集中一处,避免十余个位置参数错位)
@@ -136,5 +193,43 @@ mod tests {
         assert!(f.has_api_call);
         assert!(f.todo_or_fixme);
         assert!(f.has_error_path);
+    }
+
+    /// 回归:工具名不归一化 → 门控的 is_write_event 恒不命中 → Claude 这一路永远出不了审查卡
+    #[test]
+    fn map_tool_normalizes_claude_names_to_gate_vocabulary() {
+        assert_eq!(map_tool("Edit"), "edit");
+        assert_eq!(map_tool("MultiEdit"), "edit");
+        assert_eq!(map_tool("NotebookEdit"), "edit");
+        assert_eq!(map_tool("Write"), "write");
+        // Bash 不是写事件:把跑命令误判成改代码,会凭空造出审查卡
+        assert_eq!(map_tool("Bash"), "bash");
+        assert_eq!(map_tool("Read"), "read");
+        assert_eq!(map_tool("mcp__github__create_issue"), "mcp__github_create_issue");
+        assert_eq!(map_tool(""), "");
+    }
+
+    /// 回归:Claude Code 的 Edit 用 snake_case,旧实现只查 camelCase → diff 恒空、lineDelta 恒 0
+    #[test]
+    fn longest_str_reads_claude_snake_case_and_picks_the_longest() {
+        let input = json!({ "file_path": "a.ts", "old_string": "x", "new_string": "aaa\nbbb\nccc" });
+        let got = longest_str(&input, &["diff", "new_string", "newString", "content"]);
+        assert_eq!(got, "aaa\nbbb\nccc");
+        assert_eq!(longest_str(&json!(null), &["new_string"]), "");
+        assert_eq!(longest_str(&json!({ "a": 1 }), &["a"]), ""); // 非字符串字段不参与
+    }
+
+    #[test]
+    fn collect_files_keeps_first_seen_order_and_reads_multiedit() {
+        let input = json!({
+            "file_path": "z.ts",
+            "file_paths": ["a.ts", "z.ts"],
+            "edits": [{ "file_path": "b.ts" }, { "filePath": "a.ts" }]
+        });
+        // 顺序有意义:excerpt.files[0] 参与 G6 主题级指纹,排序会让两个适配器对同一动作给出不同键
+        assert_eq!(
+            collect_files(&input),
+            vec!["z.ts".to_string(), "a.ts".to_string(), "b.ts".to_string()]
+        );
     }
 }

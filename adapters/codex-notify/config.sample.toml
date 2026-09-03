@@ -1,0 +1,33 @@
+# KVBA × Codex CLI 接入示例
+#
+# 用法:把下面这一行**原样追加到 ~/.codex/config.toml(或 %USERPROFILE%\.codex\config.toml)的顶层**,
+# 并把路径换成你的实际绝对路径,然后重启 Codex 会话。
+#
+#   notify = ["node", "C:\\Users\\me\\KVBA\\adapters\\codex-notify\\kvba-codex-hook.mjs"]
+#
+# 三条会静默吃掉配置的坑(都实测过同类事故,别省):
+#
+# 1. **`notify` 必须是顶层键。** config.toml 里满是 `[section]` 头;一旦你把这行粘在
+#    `[tui]` 之类的段落下,它就变成 `[tui].notify`,**完全无效且没有任何报错**。
+#    放在文件第一行就不会错。
+# 2. **不要加引号、不要写 shell 语法。** Codex 直接把 argv 交给 exec,**不经过 shell**:
+#    没有管道 / `&&` / 重定向 / 环境变量展开,`$HOME` 和 `~` 都不会被展开,只认绝对路径。
+#    好处:路径带空格也**不需要**加引号(这一点和 Trae 相反 —— Trae 那条内层引号坑在这里不存在)。
+# 3. **`node` 必须在 Codex 所在环境的 PATH 里。** 用 nvm/fnm 时,GUI 启动的 Codex 未必拿到
+#    你 shell 的 PATH;拿不准就写 node 的绝对路径。
+#
+# 能力边界(不是缺陷,别去绕过):
+# - Codex 目前**只有 `agent-turn-complete` 一种 notify 事件**,没有工具级 hook,也没有"回合开始"事件。
+#   所以这一路只能喂出 `turn.ended` → KVBA 的知识分支(贴士 / 破冰 / 知情度)。
+#   **审查卡需要写事件,Codex 这一路永远拿不到** —— 想要审查卡请用 Claude Code 或 Trae。
+# - notify 不覆盖审批等待(approval-requested),被审批卡住的回合看起来和还在干活一模一样。
+# - Codex 对 notify 是 fire-and-forget,stdout/stderr 一律丢弃 —— 所以调试只能靠 KVBA_HOOK_DEBUG
+#   加手工管道自证(见下),不要指望在 Codex 终端里看到任何输出。
+#
+# 自证(不经 Codex 包装层,直接喂 payload;期望输出 `[kvba-hook] codex agent-turn-complete → ok`):
+#
+#   $env:KVBA_HOOK_DEBUG = "1"
+#   node adapters\codex-notify\kvba-codex-hook.mjs '{"type":"agent-turn-complete","thread-id":"t1","turn-id":"1","cwd":"'$PWD'","last-assistant-message":"改完 src/lib/api.ts,补了 fetch 的错误分支"}'
+#   # → fail/drop 说明 KVBA 没在跑或 endpoint.json 不对
+#
+# 项目级生效:可在仓库的 .codex/config.toml 里写同一个 notify(仅当该项目被标记为可信时才会被加载)。
