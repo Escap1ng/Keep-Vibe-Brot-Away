@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kvba_adapters::common::{build_event, collect_files, longest_str, map_tool, scan_flags, EventSpec};
+use kvba_adapters::common::{
+    build_event, collect_files, longest_str, map_tool, scan_flags, EventSpec,
+};
 use kvba_adapters::post_event;
 
 fn main() {
@@ -152,7 +154,14 @@ fn handle_line(line: &str, jsonl_path: &Path, cwd_cache: &mut HashMap<PathBuf, S
             }
             let mut diff = longest_str(
                 &input,
-                &["diff", "patch", "content", "new_string", "newString", "replacement"],
+                &[
+                    "diff",
+                    "patch",
+                    "content",
+                    "new_string",
+                    "newString",
+                    "replacement",
+                ],
             );
             if diff.is_empty() && input["edits"].is_array() {
                 diff = input["edits"]

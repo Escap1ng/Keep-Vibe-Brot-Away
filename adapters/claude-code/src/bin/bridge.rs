@@ -73,15 +73,20 @@ fn main() {
             // diff/内容摘录:优先取 input 中最长的一段,皆空时回退 tool_response
             let mut diff = longest_str(
                 &tool_input,
-                &["diff", "patch", "content", "new_string", "newString", "replacement"],
+                &[
+                    "diff",
+                    "patch",
+                    "content",
+                    "new_string",
+                    "newString",
+                    "replacement",
+                ],
             );
             if diff.is_empty() {
                 if let Some(edits) = tool_input["edits"].as_array() {
                     diff = edits
                         .iter()
-                        .map(|e| {
-                            longest_str(e, &["new_string", "newString", "replacement"])
-                        })
+                        .map(|e| longest_str(e, &["new_string", "newString", "replacement"]))
                         .collect::<Vec<_>>()
                         .join("\n");
                 }

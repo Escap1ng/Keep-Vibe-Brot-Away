@@ -205,14 +205,18 @@ mod tests {
         // Bash 不是写事件:把跑命令误判成改代码,会凭空造出审查卡
         assert_eq!(map_tool("Bash"), "bash");
         assert_eq!(map_tool("Read"), "read");
-        assert_eq!(map_tool("mcp__github__create_issue"), "mcp__github_create_issue");
+        assert_eq!(
+            map_tool("mcp__github__create_issue"),
+            "mcp__github_create_issue"
+        );
         assert_eq!(map_tool(""), "");
     }
 
     /// 回归:Claude Code 的 Edit 用 snake_case,旧实现只查 camelCase → diff 恒空、lineDelta 恒 0
     #[test]
     fn longest_str_reads_claude_snake_case_and_picks_the_longest() {
-        let input = json!({ "file_path": "a.ts", "old_string": "x", "new_string": "aaa\nbbb\nccc" });
+        let input =
+            json!({ "file_path": "a.ts", "old_string": "x", "new_string": "aaa\nbbb\nccc" });
         let got = longest_str(&input, &["diff", "new_string", "newString", "content"]);
         assert_eq!(got, "aaa\nbbb\nccc");
         assert_eq!(longest_str(&json!(null), &["new_string"]), "");
