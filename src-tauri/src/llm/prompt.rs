@@ -60,7 +60,7 @@ pub fn optimized_prompt_user(card_text: &str, ref_files: &str, diff: &str) -> St
 }
 
 /// 生成"下一轮优化提示词":写剪贴板 + 追加项目内 .kvba/next-prompt.md
-/// 调用预算:独立小调用(输出 ≤240 token,输入裁剪);无 LLM 时用模板兜底。
+/// 调用预算:独立小调用(输入裁到 ≤1200 token,输出不下发上限);无 LLM 时用模板兜底。
 pub async fn generate_optimized(state: &Arc<AppState>, card: &Card) -> anyhow::Result<String> {
     let diff = snapshot_ref_diff(state, card);
 
@@ -69,7 +69,7 @@ pub async fn generate_optimized(state: &Arc<AppState>, card: &Card) -> anyhow::R
         state,
         "你是项目伴读助手,负责生成「下一轮优化提示词」。只输出一句话指令。",
         &super::fit_tokens(&optimized_prompt_user(&card.text, &ref_files, &diff), 1200),
-        240,
+        super::MAX_OUTPUT_TOKENS,
     )
     .await
     {
