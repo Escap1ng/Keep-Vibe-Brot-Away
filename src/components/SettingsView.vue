@@ -258,6 +258,9 @@ onMounted(async () => {
           <span class="hint">卡片已入队却看不见时,先看这里</span>
         </div>
         <div class="row static"><span>今日</span><span>发卡 {{ stats?.cardsCreated ?? 0 }} · 回答 {{ stats?.answers ?? 0 }} · 不满意 {{ stats?.unsatisfied ?? 0 }}<template v-if="(stats?.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.todayAnswerRate) }}%</template></span></div>
+        <!-- 出稿来源:发卡数相同但含义完全不同。模板兜底不为 0 就说明 LLM 链路是坏的,
+             而上面那行「发卡 N」照样往上跳 —— 这个数存在的唯一理由就是让那张灯能证伪 -->
+        <div class="row static"><span>出稿来源</span><span>LLM {{ stats?.cardsLlm ?? 0 }} · 模板兜底 {{ stats?.cardsTemplate ?? 0 }}<template v-if="(stats?.cardsTemplate ?? 0) > 0"> · LLM 链路异常,详见日志与决策日志</template></span></div>
         <div class="row static"><span>累计</span><span>发卡 {{ stats?.total.cardsCreated ?? 0 }} · 回答 {{ stats?.total.answers ?? 0 }} · 不满意 {{ stats?.total.unsatisfied ?? 0 }}<template v-if="(stats?.total.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.total.answerRate) }}%</template><template v-if="(stats?.batched ?? 0) > 0"> · 攒批待发 {{ stats!.batched }}</template></span></div>
         <div class="row static"><span>框架事实</span><span>{{ facts?.framework || "未生成(Agent 有动作后自动生成)" }}</span></div>
       </fieldset>

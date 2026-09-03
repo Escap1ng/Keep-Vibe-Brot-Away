@@ -31,6 +31,12 @@ pub struct AnalysisOut {
     pub optimized_prompt: Option<String>,
     #[serde(alias = "project_path")]
     pub project_path: Option<String>,
+    /// 正文到底来自 LLM 还是模板兜底。**不参与序列化**,只给上层做可观测性用。
+    /// 必须有这一位:解析失败时 `normalize_out` 会把空正文填成模板文案,
+    /// 卡片照样入队、决策日志照样记 `G7 pass=true 卡片生成并入队` ——
+    /// 于是「LLM 一直在工作」这个结论从来就没被证伪过(实测:5 张卡里 4 张是模板原文)。
+    #[serde(skip)]
+    pub from_llm: bool,
 }
 
 impl Default for AnalysisOut {
@@ -47,6 +53,7 @@ impl Default for AnalysisOut {
             ref_files: vec![],
             optimized_prompt: None,
             project_path: None,
+            from_llm: false,
         }
     }
 }
@@ -320,7 +327,7 @@ pub async fn analyze_pass_for_project(
     let text = chat_complete(state, &system, &user, 800).await?;
 
     if let Some(out) = parse_contract(&text) {
-        return Ok(normalize_out(out, pass, &snapshot));
+        return Ok(normalize_out(out, pass, &snapshot, true));
     }
     // 解析失败:重试一次(更严格提示)。额度已由上面的 chat_complete 预留,
     // 重试走不计预算版本 —— 一次分析最多只吃一格当日额度。
@@ -329,12 +336,26 @@ pub async fn analyze_pass_for_project(
     );
     let text2 = chat_complete_unbudgeted(state, &system, &strict, 800).await?;
     if let Some(out) = parse_contract(&text2) {
-        return Ok(normalize_out(out, pass, &snapshot));
+        return Ok(normalize_out(out, pass, &snapshot, true));
     }
-    Ok(normalize_out(AnalysisOut::default(), pass, &snapshot))
+    // 两次都没拿到合法契约:退回模板。**这条必须能被外面看见**,
+    // 否则它和「LLM 正常出稿」在决策日志里长得一模一样。
+    log::warn!("卡片契约解析失败,本张退用模板文案;{}", text_probe(&text2));
+    Ok(normalize_out(
+        AnalysisOut::default(),
+        pass,
+        &snapshot,
+        false,
+    ))
 }
 
-fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot) -> AnalysisOut {
+fn normalize_out(
+    mut out: AnalysisOut,
+    pass: &GatePass,
+    snap: &AnalysisSnapshot,
+    from_llm: bool,
+) -> AnalysisOut {
+    out.from_llm = from_llm;
     let branch = pass.branch;
     let p0 = pass.p0;
 
@@ -367,6 +388,8 @@ fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot)
     if out.text.trim().is_empty() {
         // 正文为空会产出一张没有任何认知价值的空白卡,宁可退回模板文案
         out.text = AnalysisOut::fallback(pass, &snap.project_path).text;
+        // 契约虽然解析成功,但**这句话不是 LLM 写的** —— 来源必须跟着改判
+        out.from_llm = false;
     }
     if out.text.chars().count() > 120 {
         // 契约声明 ≤120 字,截断口径与之一致
@@ -636,8 +659,14 @@ mod tests {
             },
             &pass,
             &snap,
+            // 契约解析成功,但正文是空的 → 实际文案来自模板,来源必须改判
+            true,
         );
         assert!(!out.text.trim().is_empty(), "空正文应被模板文案替换");
+        assert!(
+            !out.from_llm,
+            "正文被模板回填后不得再声称 LLM 出稿,否则绿灯又开始说谎"
+        );
         assert_eq!(out.theme, "code-review");
         assert_eq!(out.project_path.as_deref(), Some("C:/proj/foo"));
     }

@@ -511,10 +511,23 @@ pub fn push_pass_card(
             crate::state::emit(&app2, ev, c);
         },
     );
-    crate::state::save_core(state);
     if matches!(outcome, InsertOutcome::Inserted) {
+        // 出稿来源单独计数:`cards_created` 对 LLM 稿和模板兜底稿一视同仁,
+        // 于是 LLM 全挂时它照样往上跳 —— 那是个不会说谎也不会报喜的灯。
+        let mut core = state.core.blocking_lock();
+        core.stats.roll_to_today();
+        if analysis.from_llm {
+            core.stats.cards_llm += 1;
+        } else {
+            core.stats.cards_template += 1;
+            log::warn!("本张卡片来自模板兜底,非 LLM 出稿(主题={})", card.theme);
+        }
+        crate::state::save_core_locked(&state.data_dir, &core);
+        drop(core);
         // 新卡 → 展开胶囊
         crate::windows::show_panel(app);
+    } else {
+        crate::state::save_core(state);
     }
     outcome
 }
