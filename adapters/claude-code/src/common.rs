@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(map_tool("Read"), "read");
         assert_eq!(
             map_tool("mcp__github__create_issue"),
-            "mcp__github_create_issue"
+            "mcp__github__create_issue"
         );
         assert_eq!(map_tool(""), "");
     }
