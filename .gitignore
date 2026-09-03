@@ -18,3 +18,7 @@ src-tauri/gen/
 # 移动端图标(本期仅桌面)
 src-tauri/icons/android/
 src-tauri/icons/ios/
+
+# 操作系统垃圾文件
+Thumbs.db
+.DS_Store
