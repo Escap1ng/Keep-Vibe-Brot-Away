@@ -1,6 +1,6 @@
 # KVBA 项目交接报告
 
-> 生成日期：2026-09-03 ｜ 基于代码库实际状态（git log `9fd097f`，工作区干净）
+> 生成日期：2026-09-03 ｜ 基于 v0.2.0 代码库状态
 > **新成员必读顺序**：本文档 → [README.md](../README.md) → [docs/复盘与工程约定.md](复盘与工程约定.md) → [docs/InitPrompt.md](InitPrompt.md)
 
 ---
@@ -38,7 +38,7 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 
 | 模块 | 位置 | 职责 |
 |---|---|---|
-| 门控决策树 | `src-tauri/src/gate/` | G1 队列硬闸 → G2 频控(25s)/主题冷却(10min) → G3 活性 → G4 分支路由 → G5 信号评分(阈值40，只统计写事件) → G6 正文去重(20min 窗口) → G7 LLM 放行。25 项门控夹具单测（全库 67 项） |
+| 门控决策树 | `src-tauri/src/gate/` | G1 队列硬闸 → G2 频控(25s)/主题冷却(10min) → G3 活性 → G4 分支路由 → G5 信号评分(阈值40，只统计写事件) → G6 正文去重(20min 窗口) → G7 LLM 放行。25 项门控夹具单测（全库 72 项） |
 | 事件摄入 | `src-tauri/src/events/` + `adapters/` | 三种 Agent 的适配器统一上报；服务端按内容指纹 5s 窗口判重（双路同报场景） |
 | 记忆层 | `src-tauri/src/memory/` | 项目级 facts（扫描 package.json/README，一次 LLM 生成 ≤50KB）+ 对话滚动窗口（3 条 ≤3KB，零 LLM） |
 | LLM 分析器 | `src-tauri/src/llm/` | providers（SSE 解析）、prompt、budget（每日额度）。**不下发 max_tokens**（Anthropic 除外 `ANTHROPIC_REQUIRED_MAX=8192`），输入侧 `fit_tokens` ≤3.5k 控制 |
@@ -60,9 +60,9 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 - opencode 插件源文件在 `adapters/opencode-plugin/kvba-plugin.ts`，`.opencode/plugins/` 是部署副本，**CI 校验两者一致**，改一处必须同步另一处。
 - 提交信息风格：`feat:` / `fix:` / `refactor:` / `docs:` / `chore:`（见 git log）。
 
-## 6. 当前进度（v0.1.0）
+## 6. 当前进度（v0.2.0）
 
-- 里程碑主体完成：事件摄入、队列、七层门控、记忆层、LLM 出稿、加密存储、胶囊 UI、三平台 CI/发布流水线均已落地，全库 70 项单测绿。
+- 里程碑主体完成：事件摄入、队列、七层门控、记忆层、LLM 出稿、加密存储、胶囊 UI、三平台 CI/发布流水线均已落地，全库现有 72 项单测。
 - 节奏参数已于 2026-09-03 按实测放宽（频控 25s、主题冷却 10min、去重窗口 20min），并新增开场破冰。
 - 适配器矩阵已扩至四种宿主（opencode / Claude Code×2 / Trae / Codex），Node 钩子均零编译、静默失败、重试 3 次后丢弃。
 - **端到端 LLM 出稿尚未最终验证闭环**（详见 §7）。
@@ -100,7 +100,7 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 | `docs/codebase-research.md` | 0.03 MB | 一次性研究报告，结论已沉淀进本报告与复盘文档，避免双份维护过期 | git 历史（`git log -- '*codebase-research*'`） |
 
 **甄别后保留（非冗余）**：
-- `node_modules/`（132 MB）：开发必需，未删除。
+- `node_modules/`：可由 `npm ci` 重建，不属于仓库内容。
 - 根 `target/`：含运行时数据（kvba-data、trae-test.json），体积小，保留。
 - `.opencode/plugins/kvba-plugin.ts`：与 `adapters/opencode-plugin/` 源文件内容一致（哈希已核对），是 CI 强制校验一致性的部署副本，**不是冗余文件**。
 - `.trae/hooks.json`：Trae 适配器的本地 hooks 配置（.gitignore 忽略），引用 `adapters/trae-hook/kvba-trae-hook.mjs`，保留。

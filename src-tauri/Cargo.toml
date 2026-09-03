@@ -1,6 +1,6 @@
 [package]
 name = "kvba"
-version = "0.1.0"
+version = "0.2.0"
 description = "Keep-Vibe-Brot-Away - 项目伴读:在 VibeCoding 间隙递知识、抛问题"
 edition = "2021"
 

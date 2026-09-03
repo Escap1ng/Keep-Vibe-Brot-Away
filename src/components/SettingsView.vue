@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 设置/历史/决策日志(三合一窗口,用完即关)
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api } from "../lib/api";
 import { DEFAULT_DAILY_BUDGET, PROMPT_PENDING_MARK } from "../lib/types";
 import type {
@@ -34,6 +35,7 @@ const decisions = ref<DecisionEntry[]>([]);
 const stats = ref<StatsInfo | null>(null);
 
 let msgTimer: ReturnType<typeof setTimeout> | null = null;
+let unlistenFocus: (() => void) | null = null;
 
 function noteSaved(msg: string) {
   savedMsg.value = msg;
@@ -152,6 +154,19 @@ onMounted(async () => {
   await loadAll();
   await loadHistory();
   await loadDecisions();
+  // 设置窗口常驻且关闭时只隐藏，重新打开不会再次触发 mounted。
+  // 每次获得焦点都刷新运行状态，避免显示应用启动时的陈旧快照。
+  unlistenFocus = await getCurrentWindow().onFocusChanged(async ({ payload }) => {
+    if (!payload) return;
+    await loadAll();
+    if (tab.value === "history") await loadHistory();
+    else if (tab.value === "log") await loadDecisions();
+  });
+});
+
+onUnmounted(() => {
+  unlistenFocus?.();
+  if (msgTimer) clearTimeout(msgTimer);
 });
 </script>
 

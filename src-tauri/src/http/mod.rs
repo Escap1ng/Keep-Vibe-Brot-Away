@@ -340,9 +340,9 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
             "队列已满:先回答或跳过一张卡片,再来一道".into(),
         ),
         crate::queue::InsertOutcome::Duplicate => (
-            "入队被拒:正文与 1h 内已递出的卡片雷同",
+            "入队被拒:正文与 20min 内已递出的卡片雷同",
             "G6",
-            "这个话题刚递过同款内容(近 1h)。等一会儿再来,或先让 Agent 干点新活".into(),
+            "这个话题刚递过同款内容(近 20min)。等一会儿再来,或先让 Agent 干点新活".into(),
         ),
     };
     log_decision(

@@ -188,7 +188,11 @@ pub fn insert_card(
         )
         .any(|c| crate::gate::fingerprint_text_for_card(c) == fp);
     if dup {
-        log::info!("正文去重:同款卡片 1h 内已递过(theme={})", card.theme);
+        log::info!(
+            "正文去重:同款卡片 {}min 内已递过(theme={})",
+            crate::gate::DEDUP_WINDOW_SECS / 60,
+            card.theme
+        );
         return InsertOutcome::Duplicate;
     }
 
@@ -527,10 +531,22 @@ pub fn push_pass_card(
             core.stats.cards_template += 1;
             log::warn!("本张卡片来自模板兜底,非 LLM 出稿(主题={})", card.theme);
         }
+        let capsule_hidden = core.capsule_hidden;
         crate::state::save_core_locked(&state.data_dir, &core);
         drop(core);
-        // 新卡 → 展开胶囊
-        crate::windows::show_panel(app);
+        if capsule_hidden {
+            // 「隐藏胶囊」必须真的保持仅托盘；新卡只发系统通知，不强行弹回面板。
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app
+                .notification()
+                .builder()
+                .title("KVBA 新卡片")
+                .body(card.text.clone())
+                .show();
+        } else {
+            // 新卡 → 展开胶囊
+            crate::windows::show_panel(app);
+        }
     } else {
         crate::state::save_core(state);
     }
@@ -689,7 +705,7 @@ mod tests {
         assert_eq!(core.queue.len(), 2);
     }
 
-    /// 仍在队未消费的卡片:不受 1h 窗口影响,任何时候都算重复
+    /// 仍在队未消费的卡片:不受 20min 窗口影响,任何时候都算重复
     /// (否则会把同一句话同时挂两份在胶囊里)
     #[test]
     fn pending_card_blocks_same_text_regardless_of_age() {
@@ -709,7 +725,7 @@ mod tests {
         );
     }
 
-    /// 已归档卡片:1h 窗口内挡、窗口外放行(只防短期复读,不做永久封禁)。
+    /// 已归档卡片:20min 窗口内挡、窗口外放行(只防短期复读,不做永久封禁)。
     /// 现场故障即 ②:19:44 那张卡 28 分钟后仍把同款挡在门外。
     #[test]
     fn archived_card_blocks_same_text_only_within_window() {
@@ -727,7 +743,7 @@ mod tests {
         assert_eq!(
             insert_card(&mut core, c.clone(), &noop_emit()),
             InsertOutcome::Duplicate,
-            "1h 内的同款仍应挡"
+            "20min 内的同款仍应挡"
         );
         for h in core.history.iter_mut() {
             h.created_at -= crate::gate::DEDUP_WINDOW_SECS + 10;
