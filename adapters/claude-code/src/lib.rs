@@ -66,7 +66,7 @@ pub fn post_event(ev: &serde_json::Value) -> anyhow::Result<bool> {
 
     let mut event_token = ep.event_token.clone();
 
-    // 用主 token 换取上报 token(KVBA 重启后 eventToken 仍有效,失败即回退)
+    // 用主 token 换取上报 token；握手失败时回退到同一份 endpoint.json 中的 token
     if let Ok(resp) = client
         .post(format!("{base}/kvba/hello"))
         .header("X-KVBA-Token", &ep.hello_token)
@@ -87,7 +87,8 @@ pub fn post_event(ev: &serde_json::Value) -> anyhow::Result<bool> {
             .json(ev)
             .send()
         {
-            Ok(_) => return Ok(true),
+            Ok(resp) if resp.status().is_success() => return Ok(true),
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
             Err(e) => last_err = e.to_string(),
         }
         if attempt < 2 {

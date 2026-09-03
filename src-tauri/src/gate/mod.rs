@@ -406,7 +406,7 @@ fn dedup_hit(ctx: &GateContext, branch: Branch, theme: &str, ref_file: &str) -> 
             return true;
         }
     }
-    // 1h 内历史重复
+    // 正文去重窗口内的历史重复
     for c in ctx.history {
         if ctx.now - c.created_at < DEDUP_WINDOW_SECS && fingerprint_for_card(c) == fp {
             return true;

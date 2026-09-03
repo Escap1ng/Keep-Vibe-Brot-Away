@@ -17,17 +17,22 @@ pub enum BudgetErr {
     Exceeded,
 }
 
+/// 跨日归零预算。检查新请求与后台攒批必须共用这一入口，否则没有新事件时
+/// 攒批会因日期不等而永久停住，无法在次日自动恢复。
+fn roll_budget_to_today(core: &mut Core) {
+    if core.budget.date != local_date() {
+        core.budget = DailyBudget::default();
+        core.budget_toast_shown = false;
+        core.pending_batch
+            .retain(|b| now_ts() - b.created_at < BATCH_TTL_SECS);
+    }
+}
+
 /// 检查并登记一次调用(原子:core 锁内完成计数,锁外落盘)
 pub fn check_then_inc(state: &Arc<AppState>) -> Result<(), BudgetErr> {
     let (budget, granted) = {
         let mut core = state.core.blocking_lock();
-        if core.budget.date != local_date() {
-            // 跨日:归零额度、重置"预算耗尽提示"标记,并丢弃已攒的陈旧批次
-            core.budget = DailyBudget::default();
-            core.budget_toast_shown = false;
-            core.pending_batch
-                .retain(|b| now_ts() - b.created_at < BATCH_TTL_SECS);
-        }
+        roll_budget_to_today(&mut core);
         // 统计计数同步跨日归并
         core.stats.roll_to_today();
         let granted = if core.budget.used >= core.settings.daily_budget {
@@ -71,15 +76,15 @@ pub fn push_batch(core: &mut Core, item: BatchItem) {
 }
 
 /// 尝试消费一条攒批(维护任务每 60s 调用):
-/// 未暂停 + 队列不满 + 有额度 + 不在 60s 弹卡频控内 → 取出最旧项异步分析并入队。
+/// 未暂停 + 队列不满 + 有额度 + 不在当前弹卡频控内 → 取出最旧项异步分析并入队。
 pub fn try_drain_batch(state: &Arc<AppState>) {
     let item = {
-        let core = state.core.blocking_lock();
+        let mut core = state.core.blocking_lock();
+        roll_budget_to_today(&mut core);
         if core.paused || core.pending_batch.is_empty() {
             return;
         }
-        let quota_ok =
-            core.budget.date == local_date() && core.budget.used < core.settings.daily_budget;
+        let quota_ok = core.budget.used < core.settings.daily_budget;
         let queue_ok =
             core.queue.iter().filter(|c| c.status == "pending").count() < crate::queue::MAX_PENDING;
         let freq_ok = core
@@ -147,5 +152,27 @@ pub fn budget_info(state: tauri::State<'_, Arc<AppState>>) -> BudgetInfo {
         used: core.budget.used,
         limit: core.settings.daily_budget,
         rejected: core.budget.rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    #[test]
+    fn stale_budget_rolls_before_batch_drain_checks_quota() {
+        let mut core = Core::empty(Settings::default());
+        core.budget.date = "2000-01-01".into();
+        core.budget.used = core.settings.daily_budget;
+        core.budget.rejected = 7;
+        core.budget_toast_shown = true;
+
+        roll_budget_to_today(&mut core);
+
+        assert_eq!(core.budget.date, local_date());
+        assert_eq!(core.budget.used, 0);
+        assert_eq!(core.budget.rejected, 0);
+        assert!(!core.budget_toast_shown);
     }
 }

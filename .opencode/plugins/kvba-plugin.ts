@@ -130,16 +130,29 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
     return i.callID ?? i.tool ?? "?";
   }
 
-  // 端点惰性重读:插件加载时 KVBA 可能尚未启动;此后每 ≥30s 重试一次,避免整会话静默失效
+  // 端点每 30s 最多重读一次；上报失败时立即失效缓存。
+  // KVBA 每次重启都会随机化端口/token，只在初次加载时读取会让当前 opencode
+  // 会话永久握着旧端点，后续事件全部静默丢失。
   let endpoint: Endpoint | null = readEndpoint();
   let lastEndpointAttempt = Date.now();
   function ensureEndpoint(): Endpoint | null {
-    if (endpoint) return endpoint;
     const now = Date.now();
-    if (now - lastEndpointAttempt < 30_000) return null;
+    if (endpoint && now - lastEndpointAttempt < 30_000) return endpoint;
+    if (!endpoint && now - lastEndpointAttempt < 30_000) return null;
     lastEndpointAttempt = now;
-    endpoint = readEndpoint();
+    endpoint = readEndpoint() ?? endpoint;
     return endpoint;
+  }
+
+  function invalidateEndpoint(failed: Endpoint) {
+    if (
+      endpoint?.port === failed.port &&
+      endpoint.helloToken === failed.helloToken &&
+      endpoint.eventToken === failed.eventToken
+    ) {
+      endpoint = null;
+      lastEndpointAttempt = 0;
+    }
   }
 
   await client.app.log({
@@ -181,7 +194,7 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
     const ep = ensureEndpoint();
     if (!ep) return;
     const ts = nowMs();
-    void postEvent(ep, {
+    const payload = {
       schema: SCHEMA,
       id: fnv16(`${eventType}|${tool}|${ts}|${intent.slice(0, 40)}`),
       emitter: "opencode-plugin",
@@ -199,6 +212,9 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
         todoOrFixme: todo,
         lineDelta,
       },
+    };
+    void postEvent(ep, payload).then((ok) => {
+      if (!ok) invalidateEndpoint(ep);
     });
   }
 

@@ -47,6 +47,20 @@ fn user_messages(req: &ChatRequest) -> Vec<Value> {
     ]
 }
 
+/// Gemini REST 请求体。单独成函数是为了锁住 REST JSON 的 camelCase 字段名；
+/// SDK 配置常用 snake_case，但直接发 JSON 时不能照搬 SDK 命名。
+fn google_request_body(req: &ChatRequest) -> Value {
+    let mut body = json!({
+        "contents": [{ "role": "user", "parts": [{ "text": req.user }] }],
+        "systemInstruction": { "parts": [{ "text": req.system }] },
+        "generationConfig": {}
+    });
+    if let Some(n) = req.max_output_tokens {
+        body["generationConfig"]["maxOutputTokens"] = json!(n);
+    }
+    body
+}
+
 /// OpenAI-compatible:POST {base}/chat/completions,data: {"choices":[{"delta":{"content":..}}]}
 async fn stream_openai(
     client: &reqwest::Client,
@@ -121,19 +135,13 @@ async fn stream_google(
     let base = base_url
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
-    let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}");
-
-    let mut body = json!({
-        "contents": [{ "role": "user", "parts": [{ "text": req.user }] }],
-        "systemInstruction": { "parts": [{ "text": req.system }] },
-        "generationConfig": {}
-    });
-    if let Some(n) = req.max_output_tokens {
-        body["generationConfig"]["max_output_tokens"] = json!(n);
-    }
+    let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse");
+    let body = google_request_body(req);
 
     let resp = client
         .post(&url)
+        // 不把密钥放进 URL：连接错误通常会把 URL写进日志，header 可避免本地泄漏。
+        .header("x-goog-api-key", key)
         .json(&body)
         .timeout(std::time::Duration::from_secs(180))
         .send()
@@ -294,6 +302,24 @@ fn drain_data_lines(buf: &mut Vec<u8>, ready: &mut VecDeque<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_rest_body_uses_camel_case_output_limit() {
+        let req = ChatRequest {
+            system: "system".into(),
+            user: "user".into(),
+            max_output_tokens: Some(8),
+        };
+        let body = google_request_body(&req);
+        assert_eq!(
+            body.pointer("/generationConfig/maxOutputTokens")
+                .and_then(Value::as_u64),
+            Some(8)
+        );
+        assert!(body
+            .pointer("/generationConfig/max_output_tokens")
+            .is_none());
+    }
 
     /// 把若干「网络块」包成流。每个元素模拟一次 TCP 写,
     /// 分块边界完全由测试控制 —— 这正是真实故障的触发条件。

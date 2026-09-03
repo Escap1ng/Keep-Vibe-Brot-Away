@@ -74,7 +74,6 @@ function fnv16(s) {
   let h = 0xcbf29ce484222325n;
   for (let i = 0; i < s.length; i++) {
     h ^= BigInt(s.charCodeAt(i));
-    h = (BigInt.asUintN(64, h) ^ BigInt(s.charCodeAt(i))) & 0xffffffffffffffffn;
     h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
   }
   return h.toString(16).padStart(16, "0");

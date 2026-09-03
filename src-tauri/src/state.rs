@@ -446,7 +446,9 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
             let path = events.last().unwrap().project_path.clone();
             let key = project_key(&path);
             let mut live = ProjectLive::default();
-            for ev in events.iter().rev().take(DIALOG_WINDOW) {
+            // 从最近 DIALOG_WINDOW 条中恢复，但保持旧→新的运行期顺序。
+            // 单纯 rev().take() 会把上下文倒过来，重启前后提示词语义不一致。
+            for ev in events.iter().rev().take(DIALOG_WINDOW).rev() {
                 let r = serde_json::to_string(ev).unwrap_or_default();
                 live.dialog
                     .push_back(r.chars().take(DIALOG_MAX_CHARS).collect());
