@@ -117,19 +117,38 @@ pub fn is_write_event(e: &NormalizedEvent) -> bool {
 }
 
 /// 生成指纹(去重用):分支 + 主题 + 首个引用文件(确定性)
+///
+/// 这是 **LLM 之前**的省钱近似:只有主题与事件文件可比对,因此它只能回答
+/// "这一类内容最近是否已花过钱",不能回答"这句话是否说过两遍"。
+/// 后者由 `fingerprint_text` 在出稿后负责 —— 两者不可混用同一口径。
 pub fn fingerprint(branch: Branch, theme: &str, ref_file: &str) -> String {
     let stub = format!("{branch:?}|{theme}|{ref_file}");
     blake3::hash(stub.as_bytes()).to_hex()[..16].to_string()
 }
 
-pub fn fingerprint_for_card(c: &Card) -> String {
-    let ref_file = c.ref_files.first().cloned().unwrap_or_default();
-    let branch = if c.kind == "review" {
+/// 正文级指纹:出稿后的真去重("同一句话别递两遍")
+pub fn fingerprint_text(branch: Branch, theme: &str, text: &str) -> String {
+    let head: String = text.chars().take(120).collect::<String>().to_lowercase();
+    let stub = format!("{branch:?}|{theme}|{head}");
+    blake3::hash(stub.as_bytes()).to_hex()[..16].to_string()
+}
+
+pub fn branch_of_kind(kind: &str) -> Branch {
+    if kind == "review" {
         Branch::Review
     } else {
         Branch::Knowledge
-    };
-    fingerprint(branch, &c.theme, &ref_file)
+    }
+}
+
+pub fn fingerprint_for_card(c: &Card) -> String {
+    let ref_file = c.ref_files.first().cloned().unwrap_or_default();
+    fingerprint(branch_of_kind(&c.kind), &c.theme, &ref_file)
+}
+
+/// 卡片正文指纹(供入队护栏使用)
+pub fn fingerprint_text_for_card(c: &Card) -> String {
+    fingerprint_text(branch_of_kind(&c.kind), &c.theme, &c.text)
 }
 
 fn text_lower(s: &str) -> String {
@@ -400,7 +419,8 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
                     scoring,
                 );
             }
-            if dedup_hit(ctx, Branch::Review, "code-review", &ref_file) {
+            // force("来一道")时豁免:此处只是主题级近似,真实去重交给出稿后的正文护栏
+            if !ctx.force && dedup_hit(ctx, Branch::Review, "code-review", &ref_file) {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "审查指纹与队列/历史重复".into()),
                     scoring,
@@ -430,7 +450,7 @@ pub fn evaluate(ctx: &GateContext) -> (GateVerdict, Scoring) {
                     scoring,
                 );
             }
-            if dedup_hit(ctx, Branch::Knowledge, &theme, &ref_file) {
+            if !ctx.force && dedup_hit(ctx, Branch::Knowledge, &theme, &ref_file) {
                 return (
                     GateVerdict::Reject(GateLevel::G6, "知识卡指纹与队列/历史重复".into()),
                     scoring,
@@ -785,6 +805,21 @@ mod tests {
         let pending = vec![card("code-review", "review", "src/app.ts")];
         let (v, _) = evaluate(&ctx(big_write(), 0, None, &cd, None, &pending, &[], 2000));
         assert!(matches!(v, GateVerdict::Reject(GateLevel::G6, _)));
+    }
+
+    /// "来一道"是用户主动授权:G6 只是主题级近似(拿不到 LLM 正文),
+    /// 不该用它把用户的手动请求打死 —— 真实去重由出稿后的正文护栏负责。
+    #[test]
+    fn force_bypasses_topic_level_g6() {
+        let cd = CooldownMap::default();
+        let pending = vec![card("code-review", "review", "src/app.ts")];
+        let mut c = ctx(big_write(), 0, None, &cd, None, &pending, &[], 2000);
+        c.force = true;
+        let (v, _) = evaluate(&c);
+        assert!(
+            matches!(v, GateVerdict::Pass(_)),
+            "force 下主题级近似不应拦截:按它会把「来一道」永久打死"
+        );
     }
 
     #[test]

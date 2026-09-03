@@ -103,7 +103,7 @@ async fn events_handler(
     }
     let ev = ev.0;
     match EventStore::ingest(&state, ev) {
-        Ok(sanitized) => {
+        Ok(Some(sanitized)) => {
             // 项目首次出现事件 → 生成 facts 首版
             crate::memory::kick_facts_if_needed(&state, &sanitized.project_path);
             // 会话结束 → 增量记忆合并(有消费记录时)
@@ -113,6 +113,10 @@ async fn events_handler(
             // 触发门控评估(异步管线)
             pipeline_run(&state, false);
             Json(json!({ "ok": true })).into_response()
+        }
+        Ok(None) => {
+            // bridge 与 watcher 同开时同一动作会报两遍:静默 ACK,不重复计信号
+            Json(json!({ "ok": true, "duplicate": true })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, format!("bad event:{e}")).into_response(),
     }
@@ -287,26 +291,35 @@ pub async fn run_pipeline_body(state: Arc<AppState>, force: bool) -> PipelineOut
         crate::llm::AnalysisOut::fallback(&pass, &snapshot.project_path)
     };
 
-    let inserted =
+    let queued =
         crate::queue::push_pass_card(&state.app, &state, &pass, analysis, snapshot.last_event_id);
+    // 三种结局必须分开陈述:混成"队列已满或同主题重复"会把人引向错误的自救动作
+    let (log_reason, level, user_reason) = match queued {
+        crate::queue::InsertOutcome::Inserted => ("卡片生成并入队", "G7", String::new()),
+        crate::queue::InsertOutcome::QueueFull => (
+            "入队被拒:队列已满(pending=3)",
+            "G1",
+            "队列已满:先回答或跳过一张卡片,再来一道".into(),
+        ),
+        crate::queue::InsertOutcome::Duplicate => (
+            "入队被拒:正文与 1h 内已递出的卡片雷同",
+            "G6",
+            "这个话题刚递过同款内容(近 1h)。等一会儿再来,或先让 Agent 干点新活".into(),
+        ),
+    };
     log_decision(
         &state,
         &snapshot.project_path,
-        "G7",
-        inserted,
-        if inserted {
-            "卡片生成并入队"
-        } else {
-            "入队被拒(队列已满或同指纹重复)"
-        },
+        level,
+        matches!(queued, crate::queue::InsertOutcome::Inserted),
+        log_reason,
         Some(&pass.branch),
         Some(scoring.score),
         elapsed,
     );
-    if inserted {
-        PipelineOutcome::CardCreated
-    } else {
-        PipelineOutcome::Rejected("G1".to_string(), "队列已满或同主题重复,卡片未入队".into())
+    match queued {
+        crate::queue::InsertOutcome::Inserted => PipelineOutcome::CardCreated,
+        _ => PipelineOutcome::Rejected(level.into(), user_reason),
     }
 }
 

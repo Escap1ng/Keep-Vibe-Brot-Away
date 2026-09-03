@@ -35,5 +35,7 @@ export const api = {
   capsuleHide: () => invoke<void>("capsule_hide"),
   capsuleShow: () => invoke<void>("capsule_show"),
   settingsOpen: () => invoke<void>("settings_open"),
+  capsuleSetState: (capsuleState: "idle" | "active" | "popup") =>
+    invoke<void>("capsule_set_state", { capsuleState }),
   quitApp: () => invoke<void>("quit_app"),
 };

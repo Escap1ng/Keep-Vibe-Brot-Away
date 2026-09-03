@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 设置/历史/决策日志(三合一窗口,用完即关)
-import { onMounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { api } from "../lib/api";
 import { DEFAULT_DAILY_BUDGET, PROMPT_PENDING_MARK } from "../lib/types";
 import type {
@@ -127,6 +127,27 @@ function fmtTime(ts: number) {
   return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 相对时间:光给绝对时刻看不出"链路是不是早就断了" */
+function fmtAgo(ts: number) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (s < 60) return `${s} 秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+
+/** 超过 10 分钟没有新事件,链路基本可以判定为未接入 */
+const EVENT_STALE_SECS = 600;
+const eventStale = computed(
+  () => !stats.value?.lastEventIn || Date.now() / 1000 - stats.value.lastEventIn > EVENT_STALE_SECS,
+);
+
+const capsuleStateLabel: Record<string, string> = {
+  idle: "圆点(idle)",
+  active: "横幅(active)",
+  popup: "队列面板(popup)",
+};
+
 onMounted(async () => {
   await loadAll();
   await loadHistory();
@@ -217,11 +238,25 @@ onMounted(async () => {
         <legend>运行状态</legend>
         <div class="row static"><span>本地端点</span><code>{{ endpoint }}</code></div>
         <div class="row static">
-          <span>最近事件</span>
-          <span v-if="stats?.lastEventIn">{{ fmtTime(stats.lastEventIn) }}(链路正常)</span>
-          <span v-else class="warn">尚未收到事件——请重启 opencode 会话以加载插件</span>
+          <span>事件链路</span>
+          <span v-if="!stats?.eventsIngested" class="warn">
+            本次运行 0 条 —— 适配器未接入。Trae 需 设置 &gt; Hooks 里启用项目 Hook
+            (配置文件 .trae/hooks.json)并新开一个会话
+          </span>
+          <span v-else-if="eventStale" class="warn">
+            本次运行 {{ stats.eventsIngested }} 条,最近 {{ fmtAgo(stats.lastEventIn!) }}
+            —— 链路曾通后已静默,检查 Agent 是否还在动作
+          </span>
+          <span v-else>
+            本次运行 {{ stats.eventsIngested }} 条 · 最近 {{ fmtAgo(stats.lastEventIn!) }}(链路正常)
+          </span>
         </div>
         <div class="row static"><span>活动项目</span><code class="proj">{{ stats?.activeProject || "—" }}</code></div>
+        <div class="row static">
+          <span>胶囊态</span>
+          <span>{{ capsuleStateLabel[stats?.capsuleState ?? "idle"] }}</span>
+          <span class="hint">卡片已入队却看不见时,先看这里</span>
+        </div>
         <div class="row static"><span>今日</span><span>发卡 {{ stats?.cardsCreated ?? 0 }} · 回答 {{ stats?.answers ?? 0 }} · 不满意 {{ stats?.unsatisfied ?? 0 }}<template v-if="(stats?.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.todayAnswerRate) }}%</template></span></div>
         <div class="row static"><span>累计</span><span>发卡 {{ stats?.total.cardsCreated ?? 0 }} · 回答 {{ stats?.total.answers ?? 0 }} · 不满意 {{ stats?.total.unsatisfied ?? 0 }}<template v-if="(stats?.total.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.total.answerRate) }}%</template><template v-if="(stats?.batched ?? 0) > 0"> · 攒批待发 {{ stats!.batched }}</template></span></div>
         <div class="row static"><span>框架事实</span><span>{{ facts?.framework || "未生成(Agent 有动作后自动生成)" }}</span></div>

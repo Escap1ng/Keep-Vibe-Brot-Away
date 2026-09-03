@@ -120,8 +120,15 @@ function extractFiles(args: Record<string, unknown> | undefined): string[] {
 }
 
 export const KvbaPlugin: Plugin = async ({ directory, client }) => {
-  // after 钩子的 input.args 即本次调用的参数;此表仅作兜底(部分版本 before 才带 args)
+  // after 钩子的 input.args 即本次调用的参数;此表仅作兜底(部分版本 before 才带 args)。
+  // 键必须优先用 callID:同一工具并发(例如并行两次 edit)时以工具名为键会互相覆盖,
+  // 导致 after 拿到另一路的参数、上报出错误的文件与 diff。
   const lastArgs = new Map<string, unknown>();
+  const LAST_ARGS_MAX = 64;
+  function callKey(input: unknown): string {
+    const i = input as { tool?: string; callID?: string };
+    return i.callID ?? i.tool ?? "?";
+  }
 
   // 端点惰性重读:插件加载时 KVBA 可能尚未启动;此后每 ≥30s 重试一次,避免整会话静默失效
   let endpoint: Endpoint | null = readEndpoint();
@@ -185,12 +192,22 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
   return {
     "tool.execute.before": async (input, output) => {
       if (!ensureEndpoint()) return;
-      lastArgs.set(input.tool, output?.args ?? null);
+      const key = callKey(input);
+      lastArgs.set(key, output?.args ?? null);
+      // 并发工具调用数不可控:超上限丢最旧(纯兜底表,丢了只是少一路参数)
+      while (lastArgs.size > LAST_ARGS_MAX) {
+        const oldest = lastArgs.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        lastArgs.delete(oldest);
+      }
     },
     "tool.execute.after": async (input, output) => {
       if (!ensureEndpoint()) return;
       const tool = input.tool;
-      const args = input.args ?? lastArgs.get(tool);
+      const key = callKey(input);
+      const fallback = lastArgs.get(key);
+      lastArgs.delete(key);
+      const args = input.args ?? fallback;
       const files = extractFiles(args as Record<string, unknown>);
       const command = pickContent(args as Record<string, unknown>, ["command", "commandText"]);
       const content = pickContent(args as Record<string, unknown>, ["content", "option"]);

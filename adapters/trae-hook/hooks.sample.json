@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"<替换为本仓库的绝对路径>\\adapters\\trae-hook\\kvba-trae-hook.mjs\"",
+            "command": "node <仓库绝对路径,须无空格;含空格改用8.3短路径,禁加引号,见README>\\adapters\\trae-hook\\kvba-trae-hook.mjs",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"<替换为本仓库的绝对路径>\\adapters\\trae-hook\\kvba-trae-hook.mjs\"",
+            "command": "node <仓库绝对路径,须无空格;含空格改用8.3短路径,禁加引号,见README>\\adapters\\trae-hook\\kvba-trae-hook.mjs",
             "timeout": 10
           }
         ]

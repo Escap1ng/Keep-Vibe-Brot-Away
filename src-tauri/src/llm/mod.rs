@@ -13,22 +13,23 @@ use serde::{Deserialize, Serialize};
 use crate::gate::GatePass;
 use crate::state::AppState;
 
-/// 分析输出契约(规格书 7.4)
+/// 分析输出契约(规格书 7.4)。
+/// 与 `Facts` 同理:允许 LLM 少回字段或用 snake_case,否则整份分析作废、退化成模板卡。
+/// 容器级 `default` 复用下方手写 `Default`(它会填好默认按钮)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct AnalysisOut {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "kind")]
     pub kind: String,
     pub severity: String,
     pub theme: String,
     pub text: String,
-    #[serde(default)]
     pub options: Vec<String>,
-    #[serde(default)]
+    #[serde(alias = "ref_files")]
     pub ref_files: Vec<String>,
-    #[serde(default)]
+    #[serde(alias = "optimized_prompt")]
     pub optimized_prompt: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "project_path")]
     pub project_path: Option<String>,
 }
 
@@ -145,14 +146,14 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-/// 通用流式对话:聚合全部文本并返回
+/// 通用流式对话:聚合全部文本并返回(**计入一格当日预算**)
 pub async fn chat_complete(
     state: &Arc<AppState>,
     system: &str,
     user: &str,
     max_output_tokens: u32,
 ) -> Result<String, String> {
-    let (provider, model, base_url, key) = config_checked(state)?;
+    let cfg = config_checked(state)?;
     if let Err(budget::BudgetErr::Exceeded) = budget::check_then_inc(state) {
         budget_toast_once(state);
         return Err(format!(
@@ -160,7 +161,30 @@ pub async fn chat_complete(
             budget::BUDGET_EXCEEDED_PREFIX
         ));
     }
+    stream_text(&cfg, system, user, max_output_tokens).await
+}
 
+/// 通用流式对话(**不计预算**):供"一次任务只预留一格额度"的调用方复用。
+/// 典型场景是契约解析失败后的严格重试——额度已在首次调用时扣过,
+/// 重试再扣会让一次分析吃掉两格当日预算。
+pub async fn chat_complete_unbudgeted(
+    state: &Arc<AppState>,
+    system: &str,
+    user: &str,
+    max_output_tokens: u32,
+) -> Result<String, String> {
+    let cfg = config_checked(state)?;
+    stream_text(&cfg, system, user, max_output_tokens).await
+}
+
+/// 真正的 HTTP 侧:指数退避重试 ≤2 次,聚合文本增量
+async fn stream_text(
+    cfg: &(String, String, Option<String>, String),
+    system: &str,
+    user: &str,
+    max_output_tokens: u32,
+) -> Result<String, String> {
+    let (provider, model, base_url, key) = cfg;
     let req = providers::ChatRequest {
         system: system.to_string(),
         user: user.to_string(),
@@ -171,8 +195,7 @@ pub async fn chat_complete(
     // 指数退避重试 ≤2 次(共 3 次尝试)
     let mut last_err = "端点连通但返回为空(无有效内容增量)".to_string();
     for attempt in 0..3 {
-        match providers::stream_chat(&client, &provider, &model, base_url.as_deref(), &key, &req)
-            .await
+        match providers::stream_chat(&client, provider, model, base_url.as_deref(), key, &req).await
         {
             Ok(mut stream) => {
                 let mut text = String::new();
@@ -237,9 +260,45 @@ pub fn parse_contract(text: &str) -> Option<AnalysisOut> {
     serde_json::from_str(extract_json(text)?).ok()
 }
 
+/// facts 解析失败的**形态**。两种故障的修法完全相反,压成一个 `None` 就只能靠猜:
+/// `Unclosed` 要提 `max_output_tokens`,`Shape` 要改契约或放宽结构体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactsParseErr {
+    /// 扫不到配对的 `}` —— 几乎总是输出被 max_output_tokens 截断
+    Unclosed,
+    /// JSON 完整,但字段类型与契约不符(带 serde 原文)
+    Shape(String),
+}
+
+impl FactsParseErr {
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Unclosed => "扫不到闭合的 `}`(输出被 max_output_tokens 截断)".into(),
+            Self::Shape(m) => format!("JSON 完整但契约不符:{m}"),
+        }
+    }
+}
+
 /// 从 LLM 文本解析 facts 结构(facts 初始生成/合并)
-pub fn parse_contract_facts(text: &str) -> Option<crate::memory::Facts> {
-    serde_json::from_str(extract_json(text)?).ok()
+pub fn parse_contract_facts(text: &str) -> Result<crate::memory::Facts, FactsParseErr> {
+    let Some(s) = extract_json(text) else {
+        return Err(FactsParseErr::Unclosed);
+    };
+    serde_json::from_str(s).map_err(|e| FactsParseErr::Shape(e.to_string()))
+}
+
+/// 供 LLM 解析失败时打印的诊断串:长度 + 首尾片段。
+/// 只留开头 240 字无法区分"被截断"和"格式不对"——**尾部才是判据**:
+/// 截断的稿子必然停在数组或字符串中间,格式错的稿子则是完整闭合的。
+pub fn text_probe(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n <= 200 {
+        return format!("长度 {n} 字,全文:{}", chars.iter().collect::<String>());
+    }
+    let head: String = chars[..120].iter().collect();
+    let tail: String = chars[n - 60..].iter().collect();
+    format!("长度 {n} 字,首部:{head} …… 尾部:{tail}")
 }
 
 /// G7 执行入口:分析门控通过的一次事件批 → 分析卡(取当前活动项目的上下文)
@@ -263,11 +322,12 @@ pub async fn analyze_pass_for_project(
     if let Some(out) = parse_contract(&text) {
         return Ok(normalize_out(out, pass, &snapshot));
     }
-    // 解析失败:重试一次(更严格提示)。注意:重试会再占一格当日预算。
+    // 解析失败:重试一次(更严格提示)。额度已由上面的 chat_complete 预留,
+    // 重试走不计预算版本 —— 一次分析最多只吃一格当日额度。
     let strict = format!(
         "{user}\n\n注意:请只返回一个 JSON 对象,不要包含任何其他文字、不要用 markdown 代码块包裹。"
     );
-    let text2 = chat_complete(state, &system, &strict, 800).await?;
+    let text2 = chat_complete_unbudgeted(state, &system, &strict, 800).await?;
     if let Some(out) = parse_contract(&text2) {
         return Ok(normalize_out(out, pass, &snapshot));
     }
@@ -303,6 +363,10 @@ fn normalize_out(mut out: AnalysisOut, pass: &GatePass, snap: &AnalysisSnapshot)
     }
     if out.severity.is_empty() {
         out.severity = if p0 { "P0".into() } else { "info".into() };
+    }
+    if out.text.trim().is_empty() {
+        // 正文为空会产出一张没有任何认知价值的空白卡,宁可退回模板文案
+        out.text = AnalysisOut::fallback(pass, &snap.project_path).text;
     }
     if out.text.chars().count() > 120 {
         // 契约声明 ≤120 字,截断口径与之一致
@@ -460,6 +524,44 @@ mod tests {
         assert_eq!(out.theme, "vue-lifecycle");
     }
 
+    /// 截断与类型不符的修法完全相反(提 max_tokens vs 改契约),
+    /// 压成同一个 None 就等于让排查者重新猜一遍 —— 这里把两态钉住
+    #[test]
+    fn facts_parse_error_distinguishes_truncation_from_shape() {
+        let truncated = "{\"framework\":\"Tauri + Vue 3\",\"techStack\":[\"Vue 3\",\"TypeScript\",\"Vite\",\"Tauri 2\",\"Rust\",\"OpenAI/G";
+        assert_eq!(
+            parse_contract_facts(truncated).unwrap_err(),
+            FactsParseErr::Unclosed
+        );
+
+        let bad_shape = "{\"framework\":\"Vue 3\",\"techStack\":\"Vue 3\"}";
+        match parse_contract_facts(bad_shape).unwrap_err() {
+            // 注意:serde 只给类型不符与列号,**不给字段名**。
+            // 所以调用方必须把原文一并打进日志(text_probe),否则排查者只能对着列号数。
+            FactsParseErr::Shape(m) => assert!(
+                m.contains("invalid type") && m.contains("expected a sequence"),
+                "应带出 serde 的类型不符原文,实际:{m}"
+            ),
+            other => panic!("数组字段收到字符串应判为 Shape,实际:{other:?}"),
+        }
+
+        let ok = "{\"framework\":\"Vue 3\",\"techStack\":[\"Vite\"],\"dir_summary\":\"两目录\"}";
+        let facts = parse_contract_facts(ok).expect("缺字段 + snake_case 别名应宽容通过");
+        assert_eq!(facts.dir_summary, "两目录");
+    }
+
+    /// 诊断串必须带尾部:截断的稿子只有尾部能看出停在数组中间
+    #[test]
+    fn text_probe_keeps_tail_for_spotting_truncation() {
+        let long = format!("{}{}", "x".repeat(300), "[\"tail-marker\"");
+        let probe = text_probe(&long);
+        assert!(probe.contains("长度 314 字"), "{probe}");
+        assert!(
+            probe.contains("尾部:") && probe.contains("tail-marker"),
+            "{probe}"
+        );
+    }
+
     #[test]
     fn parse_contract_string_with_braces_and_escapes() {
         // 字符串值内含 } 与转义引号 \"(JSON 合法转义);后面还跟着残缺的干扰对象
@@ -488,5 +590,55 @@ mod tests {
     #[test]
     fn fit_tokens_noop_when_within_budget() {
         assert_eq!(fit_tokens("短文本", 100), "短文本");
+    }
+
+    /// LLM 少给字段 / 改用 snake_case 时不得整份作废(否则只会静默退化成模板卡)
+    #[test]
+    fn parse_contract_tolerates_partial_and_snake_case_payload() {
+        let out = parse_contract(r#"{"type":"review","text":"这条 diff 里 fetch 没有异常处理"}"#)
+            .expect("缺 severity/theme 应解析成功而非整份作废");
+        assert_eq!(out.kind, "review");
+        // 缺字段由手写 Default 兜底:severity 落到 "info",options 落到默认按钮
+        assert_eq!(out.severity, "info");
+        assert_eq!(out.options.len(), 3);
+
+        let g = parse_contract(
+            r#"{"kind":"tips","severity":"P1","theme":"rust-ownership","text":"正文","ref_files":["src/a.rs"]}"#,
+        )
+        .expect("type 的别名 kind 与 ref_files 的 snake_case 都应被接受");
+        assert_eq!(g.kind, "tips");
+        assert_eq!(g.ref_files, vec!["src/a.rs"]);
+    }
+
+    /// 空正文会产出一张毫无价值的空白卡,必须回落到模板文案
+    #[test]
+    fn normalize_out_replaces_empty_text_with_template() {
+        let pass = GatePass {
+            branch: crate::gate::Branch::Review,
+            score: 90,
+            p0: false,
+            theme_hint: "code-review".into(),
+            reason: "审查分支".into(),
+        };
+        let snap = AnalysisSnapshot {
+            project_path: "C:/proj/foo".into(),
+            facts_text: String::new(),
+            dialog_text: String::new(),
+            diff_text: String::new(),
+            gate_text: String::new(),
+            ref_files: vec![],
+        };
+        let out = normalize_out(
+            AnalysisOut {
+                kind: "review".into(),
+                text: "   ".into(),
+                ..Default::default()
+            },
+            &pass,
+            &snap,
+        );
+        assert!(!out.text.trim().is_empty(), "空正文应被模板文案替换");
+        assert_eq!(out.theme, "code-review");
+        assert_eq!(out.project_path.as_deref(), Some("C:/proj/foo"));
     }
 }

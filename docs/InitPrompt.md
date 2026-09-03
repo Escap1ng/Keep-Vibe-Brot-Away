@@ -45,7 +45,7 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 使用 2 周以上,用户应能:
 - 说出项目的框架、核心链路与最近 5 次变更的动机(知情度测试通过率显著提升);
 - 主动回答审查问题的比例 > 60%(证明在"参与"而非"刷手机");
-- 生成的"下一轮优化提示词"被粘贴回 Agent 的比例 > 30%(证明问题真实且闭环成立)。
+- 生成的"下一轮优化提示词"被粘贴回 Agent 的比例 > 30%(证明问题真实且闭环成立)。**可测性说明:该指标本地无法自动测量** —— 粘回动作发生在 Agent 侧输入框,不经过 KVBA。当前只能测到"提示词已生成并写入剪贴板 + `.kvba/next-prompt.md`"这一半(埋点在 `Stats` 之外,走文件计数),真实粘回率需人工回填或后续由适配器上报一次 `message.updated` 内容比对才能得出。前两项已埋点(`stats.json`:cards_created / answers / unsatisfied,含跨日归并)。
 
 ---
 
@@ -134,8 +134,8 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 
 - 最多 **3 张 pending**;队列满 → **一切触发停止**(审查问答与知识贴士都不触发),零 LLM 调用;
 - 排泄口:① 回答(满意/不满意/自定义) ② 手动跳过 ③ "不再问这类"(写入主题冷却矩阵) ④ TTL 2 小时过期 ⑤ 卡片引用文件后来被 Agent 再次修改 → 自动标记"已过时"退场;
-- 可选(设置项,默认关):severity=P0 的审查卡在队列满时可**替换**最旧一张(总数仍 ≤3);
-- 手动按钮"来一道":旁路频控,不破队列上限。
+- 可选(设置项,默认关):severity=P0 的审查卡在队列满时可**替换**最旧一张(总数仍 ≤3)。已实现:`Settings.p0_replace_queue` → `insert_card` 满队列时替换最旧 pending 并归档(被替换卡记为 `dismissed`,有单测覆盖)。
+- 手动按钮"来一道":旁路 G2 频控、G3 活性、G4 路由与 G6 去重,**不破队列上限(G1)**。
 
 ### 5.2 卡片 Schema
 
@@ -178,16 +178,33 @@ G4 路由       最近事件含 edit/write/patch → 分支A;含 turn.ended → 
               think(且 A/B 均未命中) → 分支B(弱)
 G5-A 审查分支(信号分,来自事件 excerpt 本地字段,阈值 60)
   加分: lineDelta≥20 | 新增 API/网络调用(URL 或 http 库 import)| 新增异常路径未包 try/catch
-        | 注释密度骤降 | 含 TODO/FIXME | 删除被依赖文件 | 裸 throw 错误串
-  减分: <5 行纯格式化/重命名 | 纯 README/文档变更 | 与 10min 内已问事件同 hash
+        | 注释密度骤降(未实现,见 6.1) | 含 TODO/FIXME | 删除代码文件 | 裸 throw 错误串
+  减分: <5 行纯格式化/重命名 | 纯 README/文档变更 | 与 10min 内已问事件同 hash(未实现,见 6.1)
   得分≥60 → 审查问题;若含"网络调用无异常处理"或"覆盖不完整" → severity=P0
 G5-B 知识分支
   知识缺口(框架/目录结构/技术选型缺关键项) → awareness 知情度问题,最高优先
   命中已有主题(如 vue/nuxt) → 随机出该主题"下一个知识点"贴士
   冷却: 同主题 30min;同主题连续 2 次"不满意" → 该主题静默 1h(自动的"不再问这类")
-G6 去重       blake3(问题stub+相关文件) 与队列/历史重复 → 拒绝
+G6 去重       blake3(分支+主题+卡片正文) 与队列/历史重复 → 拒绝
 G7 执行       通过 → 仅在此处调用 LLM(单次 ≤5k)→ 生成卡片 → 入队 → 胶囊展开
 ```
+
+### 6.1 实现口径与偏差记录(代码落地后回写,以代码为准)
+
+| 规格条目 | 实现口径 | 偏差说明 |
+|---|---|---|
+| G1 队列硬闸 | `queue::MAX_PENDING = 3`,判 `pending >= 3` | 无。**唯一不被 force 旁路的闸门** |
+| G2 频控 | 距上次弹卡 < 60s 拒绝;主题冷却读 `CooldownMap`(静默 1h / 同主题 30min) | 无 |
+| G3 活性 | `ACTIVITY_WINDOW_SECS = 90`,以最近一次**成功摄入**的事件为准 | 摄入层判重丢弃的重复事件**不**刷新活性——否则 bridge+watcher 双报会把空闲期伪装成活跃期 |
+| G4 路由 | 写类工具 → 分支A;`turn.ended` / `think` → 分支B | `force` 时无事件也走分支B(用户主动索要) |
+| G5-A 加分「注释密度骤降」 | **未实现** | 纯文本启发式跨语言误报率高,且与「异常路径未包裹」重复计分。原评审 R4 已把它列为激进启发式 |
+| G5-A 加分「删除被依赖文件」 | 降级为「删除代码文件 +15」 | 0 token 原则下不建依赖图,且调 `git` 属侵入,只能按后缀判定 |
+| G5-A 减分「与 10min 内已问事件同 hash」 | **未实现**,意图由两层承担:摄入层 emitter 无关内容判重(5s)+ G6 出稿正文指纹(1h 窗口) | 打分层再放第三套 hash 窗口必然出现口径不一致 —— 「卡片进了队列却看不见」那次故障的根因正是 G6 与入队护栏用了两套指纹 |
+| G6 去重 | `blake3(分支 + 主题 + 卡片正文前 120 字小写)`,与攒批、入队护栏**共用同一函数** | 判据从「问题 stub + 相关文件」改为**出稿正文**:文件集合由 LLM 每次挑、不稳定,拿它当键会漏判;用户可感知的重复是"同一句话递两遍"。LLM 之前另有一层近似指纹(`分支+主题+refFile`)仅用于攒批去重 |
+| G6 与 force | `force`("来一道")**豁免 G6** | 用户主动索要时以"给得出内容"优先;若正文确实雷同,入队护栏返回 `Duplicate` 并如实记入决策日志 |
+| G7 结局回写 | 入队三结局 `Inserted` / `QueueFull` / `Duplicate` 分别回写决策日志与用户提示 | 早期版本合并成"队列已满或同指纹重复"的假二选一,把用户引向一条不存在的出路 |
+| G7 预算 | 一次分析最多占 **1 格**当日额度;契约解析失败的严格重试走不计预算通道 | 早期实现最坏一次分析吃 2 格 |
+| 决策日志 | 内存 `DECISION_LOG_KEEP = 200`(超 400 修剪)+ JSONL 追加落盘 | 拒绝原因带 LLM 真实错误(截 180 字),不再只写"失败" |
 
 ---
 
@@ -246,13 +263,13 @@ G7 执行       通过 → 仅在此处调用 LLM(单次 ≤5k)→ 生成卡片 
 
 ### 9.2 胶囊状态机(Capsule,TS 前端核心组件)
 
-- **idle(收缩)**:小圆点(约 36px)默认停靠屏幕右缘中部;可拖动,靠近屏幕边缘自动吸附;静态渲染,内容不变不重绘(低能耗);
+- **idle(收缩)**:小圆点(约 36px,实现取 48×48 无边框透明窗)默认停靠屏幕右缘中部;可拖动,靠近屏幕边缘(24px 内)自动吸附,多显示器按圆点所在屏计算边界并钳回工作区;静态渲染,内容不变不重绘(低能耗);
 - **active(展开)**:新卡到达 → 自动展开为"胶囊横幅"(约 320px 宽),展示当前卡片:text、ref 文件、动作按钮(满意/不满意/自定义…/跳过/不再问这类)、上/下条切换角标(切换查看队列中其余卡);
 - **popup(面板)**:用户点胶囊"队列"入口 → 展开队列列表弹层(最多 3 张,可点某张回到 active 态);
 - 任何时刻右键菜单:暂停/恢复提问、来一道、打开设置、隐藏胶囊(仅托盘图标)、退出;
 - 防侵入设计:
   - 置顶但不抢焦点:窗口 `set_focus` 仅在用户点击后发生;动画/展开不得激活窗口;
-  - 点击穿透动态开关:胶囊处于 idle 且在平视区边缘时,非交互区全区域 `set_ignore_cursor_events(true)`,用户靠近(悬停检测)再恢复交互;
+  - 点击穿透动态开关:胶囊处于 idle 且在平视区边缘时,非交互区全区域 `set_ignore_cursor_events(true)`,用户靠近(悬停检测)再恢复交互。**实现决策:本项不做**。理由:①悬停检测需要轮询窗口坐标或常驻 mouse-hook,与"非侵入、轻量"原则冲突;②权限已在 `capabilities/default.json` 声明但全仓无调用点,圆点窗口已缩到 48×48≈圆点本体,非交互区接近 0,穿透收益远小于代价;③原评审已指出该开关存在"穿透后收不回自身"的自锁问题。若将来要做,前置条件是给出**无轮询**的靠近检测方案;
   - 遮挡防护:默认停靠避开屏幕中心 2/3;支持"隐藏胶囊"退化为托盘图标;
   - 系统通知仅作为兜底:胶囊被隐藏时才用 toast 提醒,平时**不双通道**;
 - 平台注意:Windows 透明+置顶常规实现;macOS 设 window level = floating;Linux X11 正常,Wayland 下透明/置顶依赖合成器,文档标注兼容性限制。
@@ -268,28 +285,37 @@ G7 执行       通过 → 仅在此处调用 LLM(单次 ≤5k)→ 生成卡片 
 keep-vibe-brot-away/
 ├─ src-tauri/                  # Rust
 │  ├─ src/
-│  │  ├─ main.rs / lib.rs
+│  │  ├─ main.rs / lib.rs      # 单实例、命令注册表、setup 钩子
+│  │  ├─ state.rs              # Core 中枢 + 持久化 + stats/endpoint/facts 查询命令
+│  │  ├─ windows.rs            # 三窗口、拖拽吸附、工作区钳制、capsule_set_state
+│  │  ├─ tray.rs               # 托盘菜单(暂停/恢复文案随状态翻转)
+│  │  ├─ settings.rs           # settings_get/settings_put(字段级补丁,不误重置)
 │  │  ├─ gate/                 # 决策树纯函数 + 单元测试
-│  │  ├─ events/               # 归一化 schema、摄入、滚动日志
+│  │  ├─ events/               # 归一化 schema、摄入、内容判重、滚动日志
 │  │  ├─ memory/               # facts 读写与精炼、对话窗口
-│  │  ├─ llm/                  # provider 抽象、流式解析、预算
+│  │  ├─ llm/                  # provider 抽象、流式解析、预算与攒批
 │  │  ├─ crypto/               # AES-GCM + HKDF 机器指纹
-│  │  ├─ queue/                # 队列状态机、冷却矩阵
+│  │  ├─ queue/                # 队列状态机、冷却矩阵、维护任务
 │  │  └─ http/                 # 本地 HTTP 端点(tokio/axum)
 │  └─ Cargo.toml
-├─ src/                        # TS 前端(建议 Vue3+Vite+TS,UI 极简)
-│  ├─ Capsule.tsx/...          # 胶囊状态机(idle/active/popup)
-│  ├─ panels/                  # 队列弹层、设置、历史
-│  └─ ...
+├─ src/                        # Vue3 + Vite + TS(无 UI 组件库,令牌见 styles/tokens.css)
+│  ├─ components/              # CapsuleDot / CapsulePanel / SettingsView
+│  └─ lib/                     # api.ts(invoke 封装)、types.ts(与 Rust 契约对齐)
 ├─ adapters/
-│  ├─ claude-code/             # Rust bridge(读 hook JSON→POST)
-│  ├─ claude-code-watcher/     # Rust JSONL 增量 watcher(方案C)
-│  └─ opencode-plugin/         # TS 插件(官方 API 订阅事件→POST)
+│  ├─ claude-code/             # Rust 工程:src/bin/bridge.rs(hook stdin→POST)
+│  │                           #        src/bin/watcher.rs(JSONL 增量兜底,方案C)
+│  │                           #   注意:watcher 是同一 Cargo 工程的第二个 bin,不是独立目录
+│  ├─ opencode-plugin/         # TS 插件(kvba-plugin.ts);.opencode/plugins/ 下为同步副本,CI 校验一致
+│  └─ trae-hook/               # Node 脚本适配器(kvba-trae-hook.mjs + hooks.sample.json)
 └─ docs/
 ```
 
-Tauri command/event 建议清单(实现时可扩展,勿改同名语义):
-`queue_listen`(event: card.new/card.updated/card.dismissed)、`queue_answer(cardId, answer)`、`queue_dismiss(cardId)`、`queue_mute_theme(theme)`、`gate_tick()`(手动触发评估)、`capsule_set_state(idle/active/popup)`、`settings_get/settings_put`、`decision_log_list`、`history_list`。
+Tauri command/event 清单(实际注册 24 条,勿改同名语义):
+
+- 队列与门控:`queue_listen()`(返回当前 pending 卡片数组,增量走 `card.new` / `card.updated` / `card.dismissed` 事件)、`queue_answer(cardId, answer)`、`queue_dismiss(cardId)`、`queue_mute_theme(cardId)`、`gate_tick(force?)`(默认 `force=true`,即"来一道");
+- **`queue_mute_theme` 与规格草案的 `queue_mute_theme(theme)` 不同**:入参是 **cardId**,服务端从该卡片反查 `theme` 再写入冷却矩阵。理由是 UI 只有卡片句柄,让前端传主题名会把"主题"这个后端私有概念泄漏成第二真源;
+- 胶囊与窗口:`capsule_set_state(capsuleState)`(`idle`/`active`/`popup`,前端状态机上报,设置面板「运行状态」读取用于诊断)、`dock_snap`、`panel_open` / `panel_close`、`capsule_hide` / `capsule_show`、`settings_open`;
+- 配置与诊断:`settings_get` / `settings_put`(字段级补丁)、`secrets_put` / `secrets_test`、`llm_test_connection`、`budget_info`、`stats_info`、`endpoint_info`、`facts_get`、`decision_log_list`、`history_list`、`quit_app`。
 
 ---
 
@@ -306,9 +332,20 @@ Tauri command/event 建议清单(实现时可扩展,勿改同名语义):
 ## 12. 里程碑(严格按序,每个里程碑结束后进行最小功能单元测试自检)
 
 - **M1 骨架**:Tauri2 工程;托盘 + 悬浮胶囊 idle 态(透明置顶圆点、拖拽、边缘吸附、可隐藏为托盘)可运行;
-- **M2 事件摄入**:本地 HTTP 端点;claude-code bridge(含 hooks 配置说明)与 opencode TS 插件上报;events.log 滚动落盘;验收:真实 opencode 会话可见事件入队日志;
-- **M3 决策树**:纯函数+夹具单测(覆盖 G1 满队列、G2 冷却、G4 分支、G5 打分、G6 去重、P0 判定);决策日志面板可看每次评估;
+- **M2 事件摄入**:本地 HTTP 端点;claude-code bridge(含 hooks 配置说明)、opencode TS 插件、Trae hooks(node 脚本)三路适配器上报;events.log 滚动落盘 + emitter 无关内容判重;验收:真实 Agent 会话可见事件入队日志;
+- **M3 决策树**:纯函数+夹具单测(覆盖 G1 满队列、G2 冷却、G4 分支、G5 打分、G6 去重、P0 判定);决策日志面板可看每次评估(含 G7 真实结局);
 - **M4 记忆层**:facts 扫描/首版生成/增量合并;对话滚动窗口;验收:同一项目两次会话记忆连续;
-- **M5 LLM 分析器**:三 provider + SSE + 密钥加密 + 每日预算;契约输出解析与重试;
-- **M6 胶囊交互**:idle/active/popup 状态机全功能;回答/跳过/不再问这类;TTL/过时;"不满意→剪贴板+next-prompt.md";点击穿透保护;
-- **M7 打磨**:右键菜单、暂停/恢复、设置/历史面板、单实例、Windows 打包;README(安装 + Claude Code hooks 配置 + opencode 插件安装说明)。
+- **M5 LLM 分析器**:三 provider + SSE + 密钥加密 + 每日预算;契约输出解析与重试(一次分析最多占 1 格额度)、预算耗尽攒批 + 恢复补发;
+- **M6 胶囊交互**:idle/active/popup 状态机全功能;回答/跳过/不再问这类;TTL/过时;"不满意→剪贴板+next-prompt.md";点击穿透保护(**经决策取消**,理由见 §9.2);
+- **M7 打磨**:右键菜单、暂停/恢复、设置/历史面板、单实例、Windows/macOS/Linux 打包;README(安装 + 三路适配器配置说明)。
+
+---
+
+## 13. 待决事项(实现与规格的差额,需产品侧拍板)
+
+| # | 事项 | 现状 | 需决定 |
+|---|---|---|---|
+| 1 | ~~§5.1「P0 可替换队列最旧卡」是假开关~~ | **本条作废**:复核后确认 `Settings.p0_replace_queue`、`SettingsPatch`、`insert_card` 替换分支与单测均在,功能完整。此前判断源于一处错误的检索(用前端驼峰名 `p0Replace` 去 grep Rust 蛇形字段 `p0_replace_queue`) | 无需决定;若要让被替换卡不再复用 `dismissed` 状态,可另立需求 |
+| 2 | §1.5 第三项度量(提示词粘回率 > 30%) | 本地无信号源,只能测到"提示词已生成" | 是否接受人工回填,或要求适配器多报一路 `message.updated` 做文本比对(成本:多一条事件 + 一次 hash 比对) |
+| 3 | §9.1 面板置顶 | 规格要求面板"非置顶仅临时浮层",实现为 `alwaysOnTop: true` | 保持现状(面板可浮在 IDE 之上)还是回到规格语义。改回需同步处理"面板被 IDE 遮住看不见"的回归 |
+| 4 | G5-A 激进启发式 | 「注释密度骤降」未实现;其余文本启发式仍在(阈值 60) | 是否需要灰度观察期,先靠决策日志统计误报率再调分值 |
