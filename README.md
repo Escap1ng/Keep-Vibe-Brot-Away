@@ -321,3 +321,4 @@ docs/                 规格与文档(改本仓库前必读 复盘与工程约�
 | [docs/HANDOVER.md](docs/HANDOVER.md) | 项目交接报告:全貌速览、模块地图、已知问题清单、清理记录 | 新协作者入门第一站 |
 | [docs/复盘与工程约定.md](docs/复盘与工程约定.md) | 六轮复盘、铁律、缺陷现场证据、出稿判读表 | **改本仓库前必读** |
 | [docs/InitPrompt.md](docs/InitPrompt.md) | 原始技术规格书:问题定义、架构、门控树、里程碑 | 理解设计意图与取舍 |
+| [docs/rfcs/RFC-0003-workunit-cognition-ledger.md](docs/rfcs/RFC-0003-workunit-cognition-ledger.md) | 架构升级 RFC: 从事件卡片转向 WorkUnit + Insight 认知账本 | 跟进 #3 的产品方向与目标架构 |
