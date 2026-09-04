@@ -85,6 +85,7 @@ TS 前端（Vue 3）：胶囊状态机 idle/active/popup + 设置/历史/决策�
 |---|---|
 | [README.md](../README.md) | 安装运行、三 Agent 联动配置、端点发现、数据目录说明 |
 | [docs/InitPrompt.md](InitPrompt.md) | 原始技术规格书：问题定义、架构、门控树、里程碑、待决事项 |
+| [docs/rfcs/RFC-0003-workunit-cognition-ledger.md](rfcs/RFC-0003-workunit-cognition-ledger.md) | 架构升级 RFC：WorkUnit 聚合、证据化 Insight、双模式与投递策略 |
 | [docs/复盘与工程约定.md](复盘与工程约定.md) | 六轮复盘、铁律、缺陷现场证据、判读表（**必读**） |
 | [docs/HANDOVER.md](HANDOVER.md) | 本交接报告 |
 | `.github/workflows/` | ci.yml / release.yml |
