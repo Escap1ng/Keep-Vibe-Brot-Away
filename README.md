@@ -2,7 +2,7 @@
 
 在 VibeCoding 的等待间隙里,把"对项目的掌控感"递回给你。
 
-KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相关的知识点、审查质疑、知情度提问"递"给用户。它不是一个弹窗广告,而是一个**被用户消费的节奏**——问题队列最多 3 张,用户不消费,它就沉默。
+KVBA 不接管执行。它在 Agent 回合结束后把低层事件聚合为 WorkUnit，用本地 Git 与测试事件形成证据化 Insight，再通过胶囊低打扰地递给用户。问题队列最多 3 张,用户不消费,它就沉默。
 
 > **动手改这个仓库之前,先读 [docs/复盘与工程约定.md](docs/复盘与工程约定.md)。** 那里记着已经付过学费的地方:哪些是铁律、哪些坑别再踩、以及这份文档要求你如何诚实更新它。
 >
@@ -23,8 +23,8 @@ KVBA 不接管执行,只接管间隙:Agent 忙于干活时,把与当前项目相
 CodingAgent(opencode / Claude Code / Trae)
   → 适配器(opencode 插件 / claude-code bridge / jsonl watcher / Trae hook)
   → POST /kvba/events(127.0.0.1 随机端口 + token 鉴权)
-  → KVBA(Rust 核心:门控决策树 0 token / 记忆层 / 队列 / 加密存储 / LLM 客户端)
-  → 悬浮胶囊:递知识 + 抛问题,不满意自动生成「下一轮优化提示词」回写 Agent
+  → KVBA(Rust 核心:WorkUnit 聚合 / Git 证据 / Insight / 兼容门控与记忆层)
+  → 悬浮胶囊:普通洞察进入摘要队列,仅高置信高风险主动展开
 ```
 
 ---
@@ -255,7 +255,8 @@ $env:KVBA_HOOK_DEBUG = "1"
 └────────────────────────────────────────────────────────────┘
 ```
 
-- **门控决策树**(`src-tauri/src/gate/`):G1 队列硬闸 → G2 频控/主题冷却 → G3 活性 → G4 分支路由 → G5 信号评分(阈值 40,只统计写事件,P0 判定)→ G6 去重 → G7 才允许调用 LLM(单次 ≤5k token)。全部 0 token、纯函数、带 25 项门控夹具单测(全库 72 项)。面板内「决策日志」可看每次评估:Gx 层级、拒绝原因、耗时。G6 用「分支 + 主题 + 卡片正文」出稿指纹,与攒批/入队护栏同一口径;手动「来一道」(force)与「会话开场破冰」豁免 G6 这层主题级近似。
+- **WorkUnit 与证据化 Insight**(`src-tauri/src/workunit/`、`src-tauri/src/insight/`):自动链路在 `turn.ended` 收口，读取回合结束时 Git 工作区快照与测试事件，生成带结论、证据、建议动作、风险级别和置信度的结构化洞察。普通摘要只更新胶囊角标，高置信 P1/P0 才主动展开。Git 快照只描述收口时可见状态，不冒充本回合精确归因。
+- **兼容门控决策树**(`src-tauri/src/gate/`):保留给手动「来一道」和暂时没有回合边界的 Claude JSONL watcher；G1→G7 的旧卡片协议继续兼容已有队列与历史数据。
 - **节奏参数(2026-09-03 依据实测放宽)**:频率限制 25s、同主题冷却 10min、正文去重窗口 20min、静默期 1h 保持不变(静默期是用户唯一的否决权,不予放宽)。知识分支会在「项目命中主题 + 通用主题池」中轮换,优先挑最久没问过的,不再反复问同一句话。
 - **开场破冰**:每个会话的第一次评估会放行一张知识贴士(绕过频率限制与主题冷却,但不突破队列上限、不占用静默期),让"对话一开始"就有内容可看;它不会出知情度卡——那张卡必须最后生成。
 - **记忆层**(`src-tauri/src/memory/`):项目级 facts(扫描 package.json/README/目录树,首版由一次 LLM 调用生成,仅在消费 ≥20 条或会话结束时增量合并)+ 对话滚动窗口(最近 3 条 ≤3KB,零 LLM 消耗)。同一项目的 facts 生成期间只调用一次,不会逐条事件消耗额度。
@@ -275,14 +276,14 @@ $env:KVBA_HOOK_DEBUG = "1"
 | `cooldown.json` | 主题冷却矩阵 |
 | `budget.json` | 每日 LLM 预算快照 |
 | `decision-log.jsonl` | 门控决策日志(滚动 200) |
-| `projects/<sha256(path)[..16]>/` | 每项目 `events.log`(JSONL 200 条)+ `facts.json`(≤50KB) |
+| `projects/<sha256(path)[..16]>/` | 每项目 `events.log`、`facts.json`、`work-units.json`(最近 100 个)、`insights.json`(最近 300 条) |
 
 日志**不在**上面这个目录:`tauri-plugin-log` 默认同时写 stdout 与系统日志目录,打包运行时只写文件。Windows 在 `%LOCALAPPDATA%\dev.kvba.app\logs\KVBA.log`(macOS `~/Library/logs/dev.kvba.app/`,Linux `~/.local/share/dev.kvba.app/logs/`)。排查静默失败(如 facts 生成不落地)先看这个文件,不要只盯着 `tauri dev` 的终端。
 
 ## 目录结构
 
 ```text
-src-tauri/            Rust 核心(gate/events/memory/llm/crypto/queue/http + window/tray)
+src-tauri/            Rust 核心(workunit/insight/workflow + 兼容 gate/events/memory/llm/queue)
 src/                  Vue3 + Vite 前端(胶囊圆点、面板、设置/历史/决策日志)
 adapters/
   claude-code/        Rust 桥:kvba-claude-bridge(stdin hook)+kvba-claude-watcher(jsonl)

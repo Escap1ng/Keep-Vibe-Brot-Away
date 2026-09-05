@@ -727,6 +727,7 @@ mod tests {
             answer: String::new(),
             optimized_prompt: String::new(),
             project_path: "C:/proj/foo".into(),
+            insight: None,
         }
     }
 

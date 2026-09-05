@@ -21,6 +21,7 @@ let hideTimer: ReturnType<typeof setTimeout> | null = null;
 let unlisteners: Array<() => void> = [];
 
 const currentCard = computed(() => cards.value[current.value] ?? null);
+const currentInsight = computed(() => currentCard.value?.insight ?? null);
 // 必须是 computed:setup 期的一次性快照永远不会随队列刷新
 const shownCards = computed(() => cards.value.slice(0, MAX_PENDING));
 
@@ -164,6 +165,25 @@ onUnmounted(() => {
 
 const sevLabel: Record<string, string> = { info: "信息", P1: "重要", P0: "紧急" };
 const kindLabel: Record<string, string> = { review: "审查", tips: "知识", awareness: "知情度" };
+const insightLabel: Record<string, string> = {
+  explain: "本轮变更",
+  risk: "风险",
+  decision: "待确认",
+  "test-gap": "测试缺口",
+  question: "问题",
+};
+
+function cardKindLabel(card: Card) {
+  return card.insight
+    ? (insightLabel[card.insight.type] ?? "洞察")
+    : (kindLabel[card.type] ?? "提示");
+}
+
+function cardSeverityLabel(card: Card) {
+  return card.insight?.riskLevel === "P2"
+    ? "注意"
+    : (sevLabel[card.severity] ?? "信息");
+}
 </script>
 
 <template>
@@ -188,13 +208,26 @@ const kindLabel: Record<string, string> = { review: "审查", tips: "知识", aw
     <!-- active:当前卡片横幅 -->
     <section v-if="mode === 'active' && currentCard" class="card-view" :key="currentCard.id + '-act'">
       <div class="card-topline">
-        <span class="kvba-chip bb-bauhaus">{{ kindLabel[currentCard.type] }}</span>
+        <span class="kvba-chip bb-bauhaus">{{ cardKindLabel(currentCard) }}</span>
         <span class="kvba-chip" :class="currentCard.severity === 'P0' ? 'sev-p0' : 'sev-info'">
-          {{ sevLabel[currentCard.severity] }}
+          {{ cardSeverityLabel(currentCard) }}
         </span>
         <span class="theme-tag">#{{ currentCard.theme }}</span>
       </div>
       <p class="card-text">{{ currentCard.text }}</p>
+      <div v-if="currentInsight" class="insight-detail">
+        <p class="insight-scope">{{ currentInsight.importance }}</p>
+        <div
+          v-for="e in currentInsight.evidence.slice(0, 2)"
+          :key="e.kind + e.ref"
+          class="evidence-row"
+        >
+          <code>{{ e.ref }}</code>
+          <span>{{ e.excerpt }}</span>
+        </div>
+        <p class="insight-action">建议：{{ currentInsight.suggestedAction }}</p>
+        <span class="confidence">置信度 {{ Math.round(currentInsight.confidence * 100) }}%</span>
+      </div>
       <div v-if="currentCard.refFiles.length" class="ref-list">
         <span v-for="f in currentCard.refFiles.slice(0, 3)" :key="f" class="ref-file">{{ f }}</span>
       </div>
@@ -247,8 +280,8 @@ const kindLabel: Record<string, string> = { review: "审查", tips: "知识", aw
         class="queue-item pressable"
         @click="current = i; mode = 'active'"
       >
-        <span class="q-kind" :class="c.type">{{ kindLabel[c.type] }}</span>
-        <span class="q-sev" :class="c.severity">{{ sevLabel[c.severity] }}</span>
+        <span class="q-kind" :class="c.type">{{ cardKindLabel(c) }}</span>
+        <span class="q-sev" :class="c.severity">{{ cardSeverityLabel(c) }}</span>
         <span class="q-text">{{ c.text }}</span>
       </button>
     </section>
@@ -342,6 +375,7 @@ const kindLabel: Record<string, string> = { review: "审查", tips: "知识", aw
   flex: 1;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;
   gap: 10px;
   padding: 14px 12px 8px;
   border-radius: var(--r-m);
@@ -389,6 +423,35 @@ const kindLabel: Record<string, string> = { review: "审查", tips: "知识", aw
 .card-note {
   font-size: var(--fs-sm);
   color: var(--md-tertiary);
+}
+.insight-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--r-xs);
+  background: var(--md-surface);
+  font-size: var(--fs-sm);
+}
+.insight-scope,
+.insight-action {
+  line-height: 1.4;
+}
+.evidence-row {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.evidence-row code {
+  overflow: hidden;
+  color: var(--md-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.evidence-row span,
+.confidence {
+  color: var(--md-on-surface-variant);
 }
 
 .actions {

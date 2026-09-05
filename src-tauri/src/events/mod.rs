@@ -13,6 +13,21 @@ pub const MAX_INTENT_CHARS: usize = 500;
 pub const MAX_FILES: usize = 32;
 pub const ROLLING_LIMIT: usize = 200;
 
+/// 将同一 Agent 的不同适配器实现归为一个来源，同时隔离不同 Agent 恰好同名的会话。
+pub fn agent_family(emitter: &str) -> &str {
+    if emitter.starts_with("claude-code") {
+        "claude-code"
+    } else if emitter.starts_with("opencode") {
+        "opencode"
+    } else if emitter.starts_with("trae") {
+        "trae"
+    } else if emitter.starts_with("codex") {
+        "codex"
+    } else {
+        emitter
+    }
+}
+
 pub const EVENT_TYPES: &[&str] = &[
     "tool.completed",
     "tool.started",
@@ -91,29 +106,46 @@ impl NormalizedEvent {
 /// 稳定哈希(用于去重/指纹)
 pub fn hash_event(e: &NormalizedEvent) -> String {
     let seed = format!(
-        "{}|{}|{}|{}|{}",
-        e.emitter, e.event_type, e.ts, e.project_path, e.excerpt.intent
+        "{}|{}|{}|{}|{}|{}",
+        e.emitter, e.event_type, e.ts, e.project_path, e.session_id, e.excerpt.intent
     );
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
 
 /// **emitter 无关**的内容指纹:project|eventType|tool|intent|文件名|事件秒。
-/// 刻意不含 id / emitter / session_id / diff 正文 —— bridge 与 watcher 同开时,
-/// 同一动作两边给出的这些字段各不相同(或一边为空),只有"哪个项目、什么动作、
-/// 碰了哪些文件、发生在哪一秒"是双方都能对上的稳定事实。
+/// 刻意不含 id / emitter / diff 正文，但包含规范化 Agent 家族与 session：同一
+/// Claude 会话的 bridge/hook/watcher 仍可合并，不同 Agent 或并发会话不会互相
+/// 吞掉工具与测试证据。session 缺失时只能退化到 Agent 家族；边界再使用精确
+/// emitter，避免两个无 session 的适配器互相吞掉收口信号。
 /// 文件名只取 basename,避免一边给绝对路径、一边给相对路径。
 pub fn content_fingerprint(e: &NormalizedEvent) -> String {
     let mut files: Vec<&str> = e.excerpt.files.iter().map(|f| base_name(f)).collect();
     files.sort_unstable();
     files.dedup();
+    let event_identity = if e.session_id.is_empty() {
+        agent_family(&e.emitter).to_string()
+    } else {
+        format!("{}|{}", agent_family(&e.emitter), e.session_id)
+    };
+    let boundary_identity = if matches!(e.event_type.as_str(), "turn.ended" | "session.ended") {
+        if e.session_id.is_empty() {
+            e.emitter.clone()
+        } else {
+            format!("{}|{}", agent_family(&e.emitter), e.session_id)
+        }
+    } else {
+        String::new()
+    };
     let seed = format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         e.project_path,
         e.event_type,
         e.tool_name,
         e.excerpt.intent,
         files.join(","),
-        e.ts
+        e.ts,
+        event_identity,
+        boundary_identity
     );
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
@@ -249,38 +281,90 @@ mod tests {
 
     #[test]
     fn content_fingerprint_is_emitter_agnostic() {
-        // 同一动作被 bridge 与 watcher 各报一遍:id / emitter / session / diff 全不同
+        // 同一会话动作被 bridge 与 watcher 各报一遍:id / emitter / diff 不同
         let a = ev(
-            "bridge",
+            "claude-code-bridge",
             "id-1",
             "edit",
             "改登录",
             &["C:/repo/app/src/a.ts"],
             1000,
         );
-        let b = ev(
-            "watcher",
+        let mut b = ev(
+            "claude-code-watcher",
             "id-2",
             "edit",
             "改登录",
             &["C:/repo/app/src/a.ts"],
             1000,
         );
+        b.session_id = a.session_id.clone();
         assert_eq!(content_fingerprint(&a), content_fingerprint(&b));
     }
 
     #[test]
     fn path_style_and_file_order_do_not_change_fingerprint() {
         let a = ev(
-            "bridge",
+            "claude-code-bridge",
             "1",
             "edit",
             "",
             &["C:/repo/app/src/a.ts", "src/b.ts"],
             1000,
         );
-        let b = ev("watcher", "2", "edit", "", &["b.ts", "app/src/a.ts"], 1000);
+        let mut b = ev(
+            "claude-code-watcher",
+            "2",
+            "edit",
+            "",
+            &["b.ts", "app/src/a.ts"],
+            1000,
+        );
+        b.session_id = a.session_id.clone();
         assert_eq!(content_fingerprint(&a), content_fingerprint(&b));
+    }
+
+    #[test]
+    fn tool_fingerprint_separates_agents_and_sessions() {
+        let mut first = ev("claude-code-bridge", "1", "bash", "$ cargo test", &[], 1000);
+        first.session_id = "session-a".into();
+        let mut other_session = first.clone();
+        other_session.session_id = "session-b".into();
+        assert_ne!(
+            content_fingerprint(&first),
+            content_fingerprint(&other_session)
+        );
+
+        let mut other_agent = first.clone();
+        other_agent.emitter = "opencode-plugin".into();
+        assert_ne!(
+            content_fingerprint(&first),
+            content_fingerprint(&other_agent)
+        );
+    }
+
+    #[test]
+    fn boundary_fingerprint_keeps_concurrent_sessions_separate() {
+        let mut first = ev("claude-code-bridge", "1", "", "回合结束", &[], 1000);
+        first.event_type = "turn.ended".into();
+        first.session_id = "session-a".into();
+        let mut second = first.clone();
+        second.id = "2".into();
+        second.emitter = "claude-code-hook".into();
+        second.session_id = "session-b".into();
+        assert_ne!(content_fingerprint(&first), content_fingerprint(&second));
+
+        second.session_id = first.session_id.clone();
+        assert_eq!(content_fingerprint(&first), content_fingerprint(&second));
+
+        first.session_id.clear();
+        second.session_id.clear();
+        assert_ne!(content_fingerprint(&first), content_fingerprint(&second));
+
+        second.session_id = "session-a".into();
+        first.session_id = "session-a".into();
+        second.emitter = "opencode-plugin".into();
+        assert_ne!(content_fingerprint(&first), content_fingerprint(&second));
     }
 
     #[test]
