@@ -110,8 +110,15 @@ async fn events_handler(
             if sanitized.event_type == "session.ended" {
                 crate::memory::session_merge(&state, &sanitized.project_path);
             }
-            // 触发门控评估(异步管线)
-            pipeline_run(&state, false);
+            // 自动路径以 Agent 回合为边界。普通事件只参与聚合，不再逐条竞争发卡；
+            // watcher 暂无 turn.ended，保留旧路径直到它能提供可靠边界。
+            match crate::workflow::automatic_route(&sanitized) {
+                crate::workflow::AutomaticRoute::WorkUnit => {
+                    crate::workflow::schedule_boundary(&state, &sanitized)
+                }
+                crate::workflow::AutomaticRoute::LegacyWatcher => pipeline_run(&state, false),
+                crate::workflow::AutomaticRoute::AwaitBoundary => {}
+            }
             Json(json!({ "ok": true })).into_response()
         }
         Ok(None) => {

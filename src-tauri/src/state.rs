@@ -14,7 +14,9 @@
 //! ├─ endpoint.json        本地 HTTP 端点信息(端口 + 握手 token)
 //! └─ projects/<sha256(path)[..16]>/
 //!    ├─ events.log        归一化事件滚动日志(JSONL,最近 200 条)
-//!    └─ facts.json        项目全局记忆(≤50KB)
+//!    ├─ facts.json        项目全局记忆(≤50KB)
+//!    ├─ work-units.json   最近 100 个完整 Agent 回合
+//!    └─ insights.json     最近 300 条证据化洞察
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -92,6 +94,9 @@ pub struct ProjectLive {
     /// 已递过"开场破冰卡"的会话 id。每个 session 只破冰一次(瞬态,不落盘):
     /// 破冰旁路频控与主题冷却,若允许它每轮都触发,产品就退化成弹窗广告。
     pub opener_session: Option<String>,
+    /// 已完成 WorkUnit 与证据化 Insight 的内存投影；领域对象独立于胶囊卡片。
+    pub work_units: VecDeque<crate::workunit::WorkUnit>,
+    pub insights: VecDeque<crate::insight::Insight>,
 }
 
 /// 本地 HTTP 端点信息(写入 endpoint.json 供适配器读取)
@@ -210,6 +215,11 @@ pub struct Stats {
     pub total_cards_llm: u64,
     #[serde(default)]
     pub total_cards_template: u64,
+    /// 由本地 WorkUnit 证据链生成的卡片，不属于 LLM 稿或模板兜底。
+    #[serde(default)]
+    pub cards_evidence: u64,
+    #[serde(default)]
+    pub total_cards_evidence: u64,
 }
 
 impl Stats {
@@ -226,6 +236,8 @@ impl Stats {
             cards_template: 0,
             total_cards_llm: 0,
             total_cards_template: 0,
+            cards_evidence: 0,
+            total_cards_evidence: 0,
         }
     }
 
@@ -238,11 +250,13 @@ impl Stats {
             self.total_unsatisfied += self.unsatisfied;
             self.total_cards_llm += self.cards_llm;
             self.total_cards_template += self.cards_template;
+            self.total_cards_evidence += self.cards_evidence;
             self.cards_created = 0;
             self.answers = 0;
             self.unsatisfied = 0;
             self.cards_llm = 0;
             self.cards_template = 0;
+            self.cards_evidence = 0;
             self.date = today;
         }
     }
@@ -286,6 +300,8 @@ pub struct AppState {
     pub app: tauri::AppHandle,
     /// 本次进程的真实端点:HTTP 服务绑定成功后写一次,此前为空
     pub endpoint: std::sync::OnceLock<EndpointInfo>,
+    /// 串行化认知产物落盘，避免并发回合用旧快照覆盖新快照。
+    pub artifact_persist: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -299,6 +315,7 @@ impl AppState {
             data_dir,
             app: app.clone(),
             endpoint: std::sync::OnceLock::new(),
+            artifact_persist: tokio::sync::Mutex::new(()),
         });
 
         load_persisted(&state)?;
@@ -457,6 +474,30 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
             if let Some(facts) = crate::memory::load_facts(&entry.path()) {
                 live.facts = Some(facts);
             }
+            if let Ok(raw) = std::fs::read_to_string(entry.path().join("work-units.json")) {
+                if let Ok(items) = serde_json::from_str::<Vec<crate::workunit::WorkUnit>>(&raw) {
+                    live.work_units = items
+                        .into_iter()
+                        .rev()
+                        .take(crate::workunit::WORKUNIT_KEEP)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                }
+            }
+            if let Ok(raw) = std::fs::read_to_string(entry.path().join("insights.json")) {
+                if let Ok(items) = serde_json::from_str::<Vec<crate::insight::Insight>>(&raw) {
+                    live.insights = items
+                        .into_iter()
+                        .rev()
+                        .take(crate::insight::INSIGHT_KEEP)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                }
+            }
             let ts = live.events.back().map(|e| e.ts).unwrap_or(0);
             core.projects.insert(key, live);
             if newest.as_ref().map(|(t, _)| ts > *t).unwrap_or(true) {
@@ -547,6 +588,7 @@ pub struct StatsTotals {
     /// 累计里真由 LLM 出的稿数(与 cardsCreated 不等即说明有卡片走了模板兜底)
     pub cards_llm: u64,
     pub cards_template: u64,
+    pub cards_evidence: u64,
 }
 
 /// `stats_info` 的响应契约(与前端 lib/types.ts 的 StatsInfo 一一对应)
@@ -566,6 +608,7 @@ pub struct StatsInfo {
     /// 前者说明闭环在工作,后者说明契约或传输坏了而界面上一切"正常"
     pub cards_llm: u64,
     pub cards_template: u64,
+    pub cards_evidence: u64,
     pub today_answer_rate: f64,
     pub total: StatsTotals,
     pub batched: usize,
@@ -612,6 +655,7 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
         unsatisfied: s.unsatisfied,
         cards_llm: s.cards_llm,
         cards_template: s.cards_template,
+        cards_evidence: s.cards_evidence,
         today_answer_rate: answer_rate(s.answers, s.cards_created),
         total: StatsTotals {
             cards_created: s.total_cards_created,
@@ -620,6 +664,7 @@ pub fn stats_info(state: tauri::State<'_, Arc<AppState>>) -> StatsInfo {
             answer_rate: answer_rate(s.total_answers, s.total_cards_created),
             cards_llm: s.total_cards_llm,
             cards_template: s.total_cards_template,
+            cards_evidence: s.total_cards_evidence,
         },
         batched: core.pending_batch.len(),
     }
