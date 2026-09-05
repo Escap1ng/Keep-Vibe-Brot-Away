@@ -45,6 +45,9 @@ pub struct Card {
     pub optimized_prompt: String,
     #[serde(default)]
     pub project_path: String,
+    /// 新架构的领域产物旁挂在兼容卡片上；旧 queue/history JSON 缺失时仍可读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<crate::insight::Insight>,
 }
 
 /// 主题冷却矩阵条目
@@ -152,6 +155,7 @@ pub fn build_card(
         answer: String::new(),
         optimized_prompt: String::new(),
         project_path,
+        insight: None,
     }
 }
 
@@ -553,6 +557,106 @@ pub fn push_pass_card(
     outcome
 }
 
+/// 将结构化 Insight 单向投影为现有胶囊卡片。
+///
+/// Card 只是展示兼容层：完整证据仍保留在 Insight，普通摘要只入队更新圆点角标；
+/// 只有高置信 P1/P0 才主动打断用户。
+pub fn push_insight_card(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    insight: &crate::insight::Insight,
+    ref_event_id: String,
+    project_path: String,
+) -> Option<InsertOutcome> {
+    let mut ref_files = Vec::new();
+    for evidence in &insight.evidence {
+        if evidence.kind == crate::insight::EvidenceKind::File
+            && !ref_files.contains(&evidence.reference)
+        {
+            ref_files.push(evidence.reference.clone());
+        }
+        if ref_files.len() >= 5 {
+            break;
+        }
+    }
+    let theme = format!("workunit-{}", insight.kind.as_str());
+    let card = Card {
+        id: uuid::Uuid::new_v4().to_string(),
+        // Keep the legacy type union stable. Vue reads insight.type for the
+        // accurate label, while tips avoids review/awareness answer side effects.
+        kind: "tips".into(),
+        severity: insight.risk_level.card_severity().into(),
+        text: insight.conclusion.chars().take(120).collect(),
+        options: PENDING_OPTIONS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        theme: theme.clone(),
+        ref_files,
+        ref_event_id,
+        created_at: now_ts(),
+        status: "pending".into(),
+        answer: String::new(),
+        optimized_prompt: String::new(),
+        project_path,
+        insight: Some(insight.clone()),
+    };
+    let interrupt = matches!(
+        insight.risk_level,
+        crate::insight::RiskLevel::P1 | crate::insight::RiskLevel::P0
+    ) && insight.confidence >= 0.85;
+    let app_for_emit = app.clone();
+    let outcome = {
+        let mut core = state.core.blocking_lock();
+        if let Some(reason) = insight_block_reason(&core, &theme, interrupt, now_ts()) {
+            log::info!("Insight 投递被策略抑制:reason={reason},theme={theme}");
+            return None;
+        }
+        insert_card(&mut core, card.clone(), &move |event, payload| {
+            crate::state::emit(&app_for_emit, event, payload)
+        })
+    };
+    if matches!(outcome, InsertOutcome::Inserted) {
+        let mut core = state.core.blocking_lock();
+        core.stats.roll_to_today();
+        core.stats.cards_evidence += 1;
+        let capsule_hidden = core.capsule_hidden;
+        crate::state::save_core_locked(&state.data_dir, &core);
+        drop(core);
+        if interrupt && capsule_hidden {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app
+                .notification()
+                .builder()
+                .title("KVBA 高置信风险")
+                .body(card.text.clone())
+                .show();
+        } else if interrupt {
+            crate::windows::show_panel(app);
+        }
+    } else {
+        crate::state::save_core(state);
+    }
+    Some(outcome)
+}
+
+fn insight_block_reason(
+    core: &crate::state::Core,
+    theme: &str,
+    interrupt: bool,
+    now: i64,
+) -> Option<&'static str> {
+    if core.paused {
+        Some("paused")
+    } else if core.cooldowns.is_muted(theme, now) {
+        Some("muted")
+    } else if !interrupt && core.cooldowns.recently_asked(theme, now) {
+        Some("cooldown")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +679,7 @@ mod tests {
             answer: String::new(),
             optimized_prompt: String::new(),
             project_path: "C:/proj/foo".into(),
+            insight: None,
         }
     }
 
@@ -772,6 +877,71 @@ mod tests {
         assert!(
             core.history.first().unwrap().theme != "tt0",
             "最旧的应被丢弃"
+        );
+    }
+
+    #[test]
+    fn old_card_json_deserializes_without_insight() {
+        let json = r#"{"id":"1","type":"tips","severity":"info","text":"x","options":[],"theme":"t","refFiles":[],"refEventId":"e","createdAt":1,"status":"pending","answer":"","optimizedPrompt":"","projectPath":"C:/repo"}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert!(card.insight.is_none());
+        let encoded = serde_json::to_string(&card).unwrap();
+        assert!(!encoded.contains("insight"));
+    }
+
+    #[test]
+    fn insight_projection_keeps_legacy_card_type_and_metadata() {
+        let insight = crate::insight::Insight {
+            id: "ins_1".into(),
+            work_unit_id: "wu_1".into(),
+            kind: crate::insight::InsightType::Decision,
+            conclusion: "confirm dependency".into(),
+            evidence: vec![crate::insight::Evidence {
+                kind: crate::insight::EvidenceKind::File,
+                reference: "Cargo.toml".into(),
+                excerpt: "+1/-0".into(),
+            }],
+            importance: "project-wide".into(),
+            suggested_action: "confirm".into(),
+            risk_level: crate::insight::RiskLevel::P2,
+            confidence: 0.8,
+        };
+        let card = Card {
+            insight: Some(insight.clone()),
+            ..mk_card("workunit-decision", "tips", "P1", "Cargo.toml")
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        let decoded: Card = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.kind, "tips");
+        assert_eq!(decoded.insight, Some(insight));
+    }
+
+    #[test]
+    fn insight_delivery_respects_pause_mute_and_cooldown() {
+        let now = now_ts();
+        let mut core = Core::empty(Settings::default());
+        core.paused = true;
+        assert_eq!(
+            insight_block_reason(&core, "workunit-risk", false, now),
+            Some("paused")
+        );
+
+        core.paused = false;
+        core.cooldowns.mute("workunit-risk", now);
+        assert_eq!(
+            insight_block_reason(&core, "workunit-risk", true, now),
+            Some("muted")
+        );
+
+        core.cooldowns.themes.clear();
+        core.cooldowns.touch_asked("workunit-risk", now);
+        assert_eq!(
+            insight_block_reason(&core, "workunit-risk", false, now),
+            Some("cooldown")
+        );
+        assert_eq!(
+            insight_block_reason(&core, "workunit-risk", true, now),
+            None
         );
     }
 
