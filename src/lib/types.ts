@@ -7,6 +7,28 @@ export const PROMPT_PENDING_MARK = "(生成中)";
 /** 每日 LLM 调用上限默认值(与 Rust Settings::default 一致) */
 export const DEFAULT_DAILY_BUDGET = 80;
 
+export type InsightType = "risk" | "decision" | "test-gap" | "explain" | "question";
+export type EvidenceKind = "file" | "line" | "diff" | "test" | "event";
+export type RiskLevel = "info" | "P2" | "P1" | "P0";
+
+export interface Evidence {
+  kind: EvidenceKind;
+  ref: string;
+  excerpt: string;
+}
+
+export interface Insight {
+  id: string;
+  workUnitId: string;
+  type: InsightType;
+  conclusion: string;
+  evidence: Evidence[];
+  importance: string;
+  suggestedAction: string;
+  riskLevel: RiskLevel;
+  confidence: number;
+}
+
 export interface Card {
   id: string;
   type: "review" | "tips" | "awareness";
@@ -21,6 +43,7 @@ export interface Card {
   answer: string;
   optimizedPrompt: string;
   projectPath: string;
+  insight?: Insight;
 }
 
 export interface Settings {
@@ -86,6 +109,8 @@ export interface StatsInfo {
   cardsLlm: number;
   /** 当日退用模板兜底的稿数:持续走高 = 契约或传输坏了,而界面上一切"正常" */
   cardsTemplate: number;
+  /** 由本地 WorkUnit + 证据链确定性生成，不依赖 LLM。 */
+  cardsEvidence: number;
   todayAnswerRate: number;
   total: {
     cardsCreated: number;
@@ -94,6 +119,7 @@ export interface StatsInfo {
     answerRate: number;
     cardsLlm: number;
     cardsTemplate: number;
+    cardsEvidence: number;
   };
   batched: number;
 }

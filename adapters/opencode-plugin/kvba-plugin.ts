@@ -171,6 +171,9 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
   // 留空会让这一路永远拿不到破冰卡 —— 而 opencode 恰恰是最需要它的宿主(用户主动等 Agent 干活)。
   // @opencode-ai/plugin 的类型里有没有这个字段本机无法验证,故一律显式断言 + 可选链。
   let lastSessionId = "";
+  // HTTP 请求必须保持 emit 顺序。否则两个 fire-and-forget 请求可能让
+  // turn.ended 抢在最后一个 tool.completed 前到达，核心就无法无歧义收口。
+  let deliveryTail = Promise.resolve();
   function noteSessionId(...candidates: unknown[]) {
     for (const c of candidates) {
       if (typeof c === "string" && c.length > 0) {
@@ -213,7 +216,8 @@ export const KvbaPlugin: Plugin = async ({ directory, client }) => {
         lineDelta,
       },
     };
-    void postEvent(ep, payload).then((ok) => {
+    deliveryTail = deliveryTail.then(async () => {
+      const ok = await postEvent(ep, payload);
       if (!ok) invalidateEndpoint(ep);
     });
   }

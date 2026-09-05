@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod events;
 pub mod gate;
 pub mod http;
+pub mod insight;
 pub mod llm;
 pub mod memory;
 pub mod queue;
@@ -11,6 +12,8 @@ pub mod settings;
 pub mod state;
 pub mod tray;
 pub mod windows;
+pub mod workflow;
+pub mod workunit;
 
 use tauri::Manager;
 
@@ -86,6 +89,8 @@ pub fn run() {
             crate::state::endpoint_info,
             crate::state::facts_get,
             crate::state::stats_info,
+            crate::workflow::work_units_list,
+            crate::workflow::insights_list,
             crate::crypto::secrets_put,
             crate::crypto::secrets_test,
             crate::llm::budget::budget_info,
