@@ -1,5 +1,6 @@
 //! KVBA 核心库入口:Tauri 应用装配(托盘、悬浮胶囊窗口、模块装配)
 
+pub mod cognition_store;
 pub mod crypto;
 pub mod events;
 pub mod gate;

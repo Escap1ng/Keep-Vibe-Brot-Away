@@ -131,9 +131,16 @@ async fn process_completed(
 
 async fn persist_project_artifacts(state: &Arc<AppState>, project_path: &str) {
     let _persist_guard = state.artifact_persist.lock().await;
+    let project_key = crate::state::project_key(project_path);
+    if state.cognition_persistence_blocked(&project_key) {
+        log::error!(
+            "项目 {project_key} 的认知快照此前加载失败，本轮仅保留在内存；请先备份并修复 cognition.json"
+        );
+        return;
+    }
     let (work_units, insights) = {
         let core = state.core.blocking_lock();
-        let Some(project) = core.projects.get(&crate::state::project_key(project_path)) else {
+        let Some(project) = core.projects.get(&project_key) else {
             return;
         };
         (
@@ -142,39 +149,24 @@ async fn persist_project_artifacts(state: &Arc<AppState>, project_path: &str) {
         )
     };
     let directory = state.project_dir(project_path);
-    if let Err(error) = std::fs::create_dir_all(&directory) {
-        log::error!(
-            "创建 {} 失败:{error} —— WorkUnit/Insight 本轮只能保留在内存",
-            directory.display()
-        );
-        return;
-    }
-    for (name, value) in [
-        ("work-units.json", PersistValue::WorkUnits(&work_units)),
-        ("insights.json", PersistValue::Insights(&insights)),
-    ] {
-        let path = directory.join(name);
-        if let Err(error) = write_json(&path, value) {
-            log::error!(
-                "写入 {} 失败:{error} —— 重启后会丢失本轮认知产物",
+    let snapshot = crate::cognition_store::CognitionSnapshot::new(
+        project_key.clone(),
+        work_units,
+        insights,
+    );
+    if let Err(error) = crate::cognition_store::save(&directory, &project_key, &snapshot) {
+        let path = directory.join(crate::cognition_store::COGNITION_FILE);
+        match &error {
+            crate::cognition_store::CognitionStoreError::Durability { .. } => log::error!(
+                "{} 已替换为新快照，但父目录同步失败:{error} —— 当前内容可读，断电耐久性未确认",
                 path.display()
-            );
+            ),
+            _ => log::error!(
+                "原子写入 {} 失败:{error} —— 本轮认知产物仅保留在内存",
+                path.display()
+            ),
         }
     }
-}
-
-enum PersistValue<'a> {
-    WorkUnits(&'a [WorkUnit]),
-    Insights(&'a [Insight]),
-}
-
-fn write_json(path: &std::path::Path, value: PersistValue<'_>) -> anyhow::Result<()> {
-    let data = match value {
-        PersistValue::WorkUnits(units) => serde_json::to_vec_pretty(units)?,
-        PersistValue::Insights(insights) => serde_json::to_vec_pretty(insights)?,
-    };
-    std::fs::write(path, data)?;
-    Ok(())
 }
 
 #[tauri::command]

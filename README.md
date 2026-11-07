@@ -276,7 +276,7 @@ $env:KVBA_HOOK_DEBUG = "1"
 | `cooldown.json` | 主题冷却矩阵 |
 | `budget.json` | 每日 LLM 预算快照 |
 | `decision-log.jsonl` | 门控决策日志(滚动 200) |
-| `projects/<sha256(path)[..16]>/` | 每项目 `events.log`、`facts.json`、`work-units.json`(最近 100 个)、`insights.json`(最近 300 条) |
+| `projects/<sha256(path)[..16]>/` | 每项目 `events.log`、`facts.json`、`cognition.json`（WorkUnit/Insight 单一原子快照；首次启动保留并迁移旧双文件） |
 
 日志**不在**上面这个目录:`tauri-plugin-log` 默认同时写 stdout 与系统日志目录,打包运行时只写文件。Windows 在 `%LOCALAPPDATA%\dev.kvba.app\logs\KVBA.log`(macOS `~/Library/logs/dev.kvba.app/`,Linux `~/.local/share/dev.kvba.app/logs/`)。排查静默失败(如 facts 生成不落地)先看这个文件,不要只盯着 `tauri dev` 的终端。
 

@@ -161,7 +161,8 @@ Phase 1 采用分层边界：
 - `turn.ended`/有效 `session.ended` 严格按摄入顺序收口 WorkUnit；适配器必须串行投递，避免用秒级时间戳猜测相邻回合归属；
 - 收口后在后台读取本地 Git 工作区快照；工作区干净或采集失败时，可降级为 Agent 写事件声明的文件证据，失败与不完整状态显式保留且不阻塞上报端；
 - 确定性生成 `explain`、`test-gap`、`risk`、`decision` Insight，每条都必须引用 file/test/event 证据；
-- 全量领域对象分别滚动保存到 `work-units.json` 与 `insights.json`，胶囊只消费一条按 `risk → decision → test-gap → explain` 选择的主洞察投影；
+- WorkUnit 与 Insight 在同一份 `cognition.json` 原子快照中滚动保存，避免崩溃时出现跨文件新旧混代；旧 `work-units.json` / `insights.json` 仅作首次迁移输入并原样保留；
+- 胶囊只消费一条主洞察投影：先按 `P0 → P1 → P2 → Info`，同级再按 `risk → decision → test-gap → explain → question` 选择，避免低风险类型遮住高风险证据；
 - 普通摘要仅进入队列，仅高置信 P1/P0 主动展开。
 
 当前限制：Git 证据是“回合结束时工作区相对 HEAD 的快照”，尚未建立回合开始基线，因此不能覆盖本回合内已经提交的变化，也不能将共享工作区中的全部变化归因给当前 Agent。Claude JSONL watcher 尚不产生 `turn.ended`，暂走旧门控兼容路径。ProjectModel/UserModel、SQLite、动作闭环和 20 个真实任务回放仍属于后续阶段。
