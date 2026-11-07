@@ -149,11 +149,8 @@ async fn persist_project_artifacts(state: &Arc<AppState>, project_path: &str) {
         )
     };
     let directory = state.project_dir(project_path);
-    let snapshot = crate::cognition_store::CognitionSnapshot::new(
-        project_key.clone(),
-        work_units,
-        insights,
-    );
+    let snapshot =
+        crate::cognition_store::CognitionSnapshot::new(project_key.clone(), work_units, insights);
     if let Err(error) = crate::cognition_store::save(&directory, &project_key, &snapshot) {
         let path = directory.join(crate::cognition_store::COGNITION_FILE);
         match &error {
