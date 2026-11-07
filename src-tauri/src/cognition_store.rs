@@ -90,10 +90,7 @@ pub enum CognitionStoreError {
     },
     /// 原子替换已经完成，但父目录同步失败。文件内容已是新快照，只是
     /// 断电后的目录项耐久性没有得到确认。
-    Durability {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Durability { path: PathBuf, source: io::Error },
 }
 
 impl CognitionStoreError {
@@ -234,10 +231,7 @@ pub fn save(
         .map_err(|error| CognitionStoreError::json("encode", &target_path, error))?;
     payload.push(b'\n');
 
-    let temp_path = project_dir.join(format!(
-        ".cognition.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let temp_path = project_dir.join(format!(".cognition.{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = write_and_replace(&temp_path, &target_path, &payload);
     if result.is_err() {
         // Cleanup is best-effort. The unique temp name is never considered by

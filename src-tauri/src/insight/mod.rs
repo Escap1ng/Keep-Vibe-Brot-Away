@@ -355,9 +355,7 @@ fn event_risk(work_unit: &WorkUnit, events: &[NormalizedEvent]) -> Option<Insigh
     {
         if evidence
             .iter()
-            .any(|item| {
-                item.kind == EvidenceKind::File && item.reference.as_str() == path.as_str()
-            })
+            .any(|item| item.kind == EvidenceKind::File && item.reference.as_str() == path.as_str())
         {
             continue;
         }

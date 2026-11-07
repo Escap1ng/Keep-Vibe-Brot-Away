@@ -581,9 +581,7 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
                     }
                 },
                 Err(error) => {
-                    log::error!(
-                        "项目 {key} 的权威认知快照损坏或不可读:{error}；已禁止覆盖原文件"
-                    );
+                    log::error!("项目 {key} 的权威认知快照损坏或不可读:{error}；已禁止覆盖原文件");
                     state.block_cognition_persistence(&key);
                 }
             }
