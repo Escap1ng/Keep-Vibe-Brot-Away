@@ -377,7 +377,8 @@ fn normalize_out(
 
     // 投影路径/类型/严重性兜底
     out.project_path = Some(snap.project_path.clone());
-    if out.kind.is_empty() {
+    if !matches!(out.kind.as_str(), "review" | "tips" | "awareness") {
+        let invalid = std::mem::take(&mut out.kind);
         out.kind = match branch {
             crate::gate::Branch::Review => "review".into(),
             crate::gate::Branch::Knowledge if pass.theme_hint == "framework-unknown" => {
@@ -385,6 +386,9 @@ fn normalize_out(
             }
             crate::gate::Branch::Knowledge => "tips".into(),
         };
+        if !invalid.is_empty() {
+            log::warn!("LLM 返回未知卡片类型 {invalid:?}，已回落为 {}", out.kind);
+        }
     }
     if out.theme.is_empty() {
         out.theme = pass.theme_hint.clone();
@@ -398,8 +402,21 @@ fn normalize_out(
     if out.ref_files.is_empty() {
         out.ref_files = snap.ref_files.clone();
     }
-    if out.severity.is_empty() {
-        out.severity = if p0 { "P0".into() } else { "info".into() };
+    if !matches!(out.severity.as_str(), "info" | "P1" | "P0") {
+        let invalid = std::mem::take(&mut out.severity);
+        out.severity = if p0 {
+            "P0".into()
+        } else if branch == crate::gate::Branch::Review {
+            "P1".into()
+        } else {
+            "info".into()
+        };
+        if !invalid.is_empty() {
+            log::warn!(
+                "LLM 返回未知严重级别 {invalid:?}，已回落为 {}",
+                out.severity
+            );
+        }
     }
     if out.text.trim().is_empty() {
         // 正文为空会产出一张没有任何认知价值的空白卡,宁可退回模板文案
@@ -696,5 +713,38 @@ mod tests {
         );
         assert_eq!(out.theme, "code-review");
         assert_eq!(out.project_path.as_deref(), Some("C:/proj/foo"));
+    }
+
+    #[test]
+    fn normalize_out_rejects_values_outside_frontend_union() {
+        let pass = GatePass {
+            branch: crate::gate::Branch::Review,
+            score: 90,
+            p0: false,
+            theme_hint: "code-review".into(),
+            reason: "审查分支".into(),
+        };
+        let snap = AnalysisSnapshot {
+            project_path: "C:/proj/foo".into(),
+            facts_text: String::new(),
+            dialog_text: String::new(),
+            diff_text: String::new(),
+            gate_text: String::new(),
+            ref_files: vec![],
+        };
+        let out = normalize_out(
+            AnalysisOut {
+                kind: "warning".into(),
+                severity: "critical".into(),
+                text: "检查异常处理".into(),
+                ..Default::default()
+            },
+            &pass,
+            &snap,
+            true,
+        );
+        assert_eq!(out.kind, "review");
+        assert_eq!(out.severity, "P1");
+        assert!(out.from_llm, "只修正枚举值不改变正文来源");
     }
 }

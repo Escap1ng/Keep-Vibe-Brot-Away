@@ -5,6 +5,13 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
+import {
+  cardDisplayText,
+  cardKindPresentation,
+  cardSeverityClass,
+  cardSeverityLabel,
+  cardShowsReferenceFiles,
+} from "../lib/cardPresentation";
 import { MAX_PENDING, PROMPT_PENDING_MARK } from "../lib/types";
 import type { Card } from "../lib/types";
 
@@ -163,27 +170,6 @@ onUnmounted(() => {
   if (toastTimer) clearTimeout(toastTimer);
 });
 
-const sevLabel: Record<string, string> = { info: "信息", P1: "重要", P0: "紧急" };
-const kindLabel: Record<string, string> = { review: "审查", tips: "知识", awareness: "知情度" };
-const insightLabel: Record<string, string> = {
-  explain: "本轮变更",
-  risk: "风险",
-  decision: "待确认",
-  "test-gap": "测试缺口",
-  question: "问题",
-};
-
-function cardKindLabel(card: Card) {
-  return card.insight
-    ? (insightLabel[card.insight.type] ?? "洞察")
-    : (kindLabel[card.type] ?? "提示");
-}
-
-function cardSeverityLabel(card: Card) {
-  return card.insight?.riskLevel === "P2"
-    ? "注意"
-    : (sevLabel[card.severity] ?? "信息");
-}
 </script>
 
 <template>
@@ -208,18 +194,18 @@ function cardSeverityLabel(card: Card) {
     <!-- active:当前卡片横幅 -->
     <section v-if="mode === 'active' && currentCard" class="card-view" :key="currentCard.id + '-act'">
       <div class="card-topline">
-        <span class="kvba-chip bb-bauhaus">{{ cardKindLabel(currentCard) }}</span>
-        <span class="kvba-chip" :class="currentCard.severity === 'P0' ? 'sev-p0' : 'sev-info'">
+        <span class="kvba-chip bb-bauhaus">{{ cardKindPresentation(currentCard).label }}</span>
+        <span class="kvba-chip" :class="cardSeverityClass(currentCard)">
           {{ cardSeverityLabel(currentCard) }}
         </span>
-        <span class="theme-tag">#{{ currentCard.theme }}</span>
+        <span v-if="!currentInsight" class="theme-tag">#{{ currentCard.theme }}</span>
       </div>
-      <p class="card-text">{{ currentCard.text }}</p>
+      <p class="card-text">{{ cardDisplayText(currentCard) }}</p>
       <div v-if="currentInsight" class="insight-detail">
         <p class="insight-scope">{{ currentInsight.importance }}</p>
         <div
-          v-for="e in currentInsight.evidence.slice(0, 2)"
-          :key="e.kind + e.ref"
+          v-for="(e, index) in currentInsight.evidence"
+          :key="`${e.kind}:${e.ref}:${index}`"
           class="evidence-row"
         >
           <code>{{ e.ref }}</code>
@@ -228,7 +214,7 @@ function cardSeverityLabel(card: Card) {
         <p class="insight-action">建议：{{ currentInsight.suggestedAction }}</p>
         <span class="confidence">置信度 {{ Math.round(currentInsight.confidence * 100) }}%</span>
       </div>
-      <div v-if="currentCard.refFiles.length" class="ref-list">
+      <div v-if="cardShowsReferenceFiles(currentCard)" class="ref-list">
         <span v-for="f in currentCard.refFiles.slice(0, 3)" :key="f" class="ref-file">{{ f }}</span>
       </div>
       <div class="card-note" v-if="currentCard.status === 'stale'">该卡引用的文件被再次修改,已标记为过时。</div>
@@ -280,9 +266,11 @@ function cardSeverityLabel(card: Card) {
         class="queue-item pressable"
         @click="current = i; mode = 'active'"
       >
-        <span class="q-kind" :class="c.type">{{ cardKindLabel(c) }}</span>
-        <span class="q-sev" :class="c.severity">{{ cardSeverityLabel(c) }}</span>
-        <span class="q-text">{{ c.text }}</span>
+        <span class="q-kind" :class="cardKindPresentation(c).className">
+          {{ cardKindPresentation(c).label }}
+        </span>
+        <span class="q-sev" :class="cardSeverityClass(c)">{{ cardSeverityLabel(c) }}</span>
+        <span class="q-text">{{ cardDisplayText(c) }}</span>
       </button>
     </section>
 
@@ -396,6 +384,14 @@ function cardSeverityLabel(card: Card) {
 }
 .sev-info {
   background: var(--md-outline-variant);
+}
+.sev-p2 {
+  background: var(--md-tertiary-container);
+  color: var(--on-tertiary-container);
+}
+.sev-p1 {
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
 }
 .theme-tag {
   margin-left: auto;
@@ -598,10 +594,18 @@ function cardSeverityLabel(card: Card) {
 }
 .q-sev {
   font-size: var(--fs-sm);
+  background: transparent;
 }
-.q-sev.P0 {
+.q-sev.sev-p0 {
   color: var(--md-error);
   font-weight: 700;
+}
+.q-sev.sev-p1 {
+  color: var(--md-on-error-container);
+  font-weight: 600;
+}
+.q-sev.sev-p2 {
+  color: var(--md-tertiary);
 }
 .q-text {
   font-size: var(--fs-md);
