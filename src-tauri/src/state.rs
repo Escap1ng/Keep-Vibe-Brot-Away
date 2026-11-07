@@ -15,9 +15,10 @@
 //! └─ projects/<sha256(path)[..16]>/
 //!    ├─ events.log        归一化事件滚动日志(JSONL,最近 200 条)
 //!    ├─ facts.json        项目全局记忆(≤50KB)
-//!    ├─ work-units.json   最近 100 个完整 Agent 回合
-//!    └─ insights.json     最近 300 条证据化洞察
+//!    └─ cognition.json    WorkUnit + Insight 单一原子快照
 //! ```
+//!
+//! `work-units.json` / `insights.json` 仅作为 v0.2.0 迁移输入保留，不再写入。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -302,6 +303,9 @@ pub struct AppState {
     pub endpoint: std::sync::OnceLock<EndpointInfo>,
     /// 串行化认知产物落盘，避免并发回合用旧快照覆盖新快照。
     pub artifact_persist: tokio::sync::Mutex<()>,
+    /// 权威快照损坏时禁止继续覆盖。必须保留原文件给用户恢复，不能把解析
+    /// 失败静默当成空账本后用下一轮数据覆盖掉。
+    pub cognition_blocked: std::sync::Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -316,6 +320,7 @@ impl AppState {
             app: app.clone(),
             endpoint: std::sync::OnceLock::new(),
             artifact_persist: tokio::sync::Mutex::new(()),
+            cognition_blocked: std::sync::Mutex::new(HashSet::new()),
         });
 
         load_persisted(&state)?;
@@ -333,6 +338,20 @@ impl AppState {
         let dir = self.project_dir(project_path);
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    pub fn block_cognition_persistence(&self, key: &str) {
+        self.cognition_blocked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(key.to_string());
+    }
+
+    pub fn cognition_persistence_blocked(&self, key: &str) -> bool {
+        self.cognition_blocked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(key)
     }
 }
 
@@ -440,77 +459,176 @@ pub fn load_persisted(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
-    // 项目事件恢复:重启后还原最近事件/对话窗口/facts/活动项目
-    // (保证"来一道"与记忆在重启后仍然可用)
+    // 项目恢复:事件与认知快照彼此独立。即使 events.log 缺失或损坏，
+    // 已完成的 WorkUnit/Insight 也必须能恢复，不能被当成空账本覆盖。
     let projects_dir = dir.join("projects");
     if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-        let mut newest: Option<(i64, String)> = None;
+        let mut newest_event: Option<(i64, String)> = None;
+        let mut newest_cognition: Option<(i64, String)> = None;
         for entry in entries.flatten() {
-            let log = entry.path().join("events.log");
-            let Ok(raw) = std::fs::read_to_string(&log) else {
+            let project_dir = entry.path();
+            let key = entry.file_name().to_string_lossy().into_owned();
+            if key.len() != 16 || !key.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                log::warn!("忽略无法识别的项目数据目录:{}", project_dir.display());
                 continue;
-            };
+            }
+
+            let mut live = ProjectLive::default();
+            let mut has_project_data = false;
             let mut events: Vec<NormalizedEvent> = Vec::new();
-            for line in raw.lines().rev().take(crate::events::ROLLING_LIMIT) {
-                if let Ok(ev) = serde_json::from_str::<NormalizedEvent>(line) {
-                    events.push(ev);
+            let log_path = project_dir.join("events.log");
+            match std::fs::read_to_string(&log_path) {
+                Ok(raw) => {
+                    let mut invalid_lines = 0usize;
+                    for line in raw.lines().rev().take(crate::events::ROLLING_LIMIT) {
+                        match serde_json::from_str::<NormalizedEvent>(line) {
+                            Ok(event) => events.push(event),
+                            Err(_) => invalid_lines += 1,
+                        }
+                    }
+                    if invalid_lines > 0 {
+                        log::warn!(
+                            "{} 含 {invalid_lines} 条无法解析的事件，已跳过",
+                            log_path.display()
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::warn!("读取 {} 失败:{error}", log_path.display());
                 }
             }
             events.reverse();
-            if events.is_empty() {
-                continue;
+            if !events.is_empty() {
+                has_project_data = true;
+                let path = events.last().unwrap().project_path.clone();
+                let event_key = project_key(&path);
+                if event_key != key {
+                    log::error!(
+                        "项目目录键与事件路径不一致:dir={key},event={event_key}；按目录隔离加载"
+                    );
+                }
+                // 从最近 DIALOG_WINDOW 条中恢复，但保持旧→新的运行期顺序。
+                // 单纯 rev().take() 会把上下文倒过来，重启前后提示词语义不一致。
+                for ev in events.iter().rev().take(DIALOG_WINDOW).rev() {
+                    let raw = serde_json::to_string(ev).unwrap_or_default();
+                    live.dialog
+                        .push_back(raw.chars().take(DIALOG_MAX_CHARS).collect());
+                }
+                live.events = events.into_iter().collect();
+                let ts = live.events.back().map(|event| event.ts).unwrap_or(0);
+                if newest_event
+                    .as_ref()
+                    .map(|(newest_ts, _)| ts > *newest_ts)
+                    .unwrap_or(true)
+                {
+                    newest_event = Some((ts, key.clone()));
+                }
             }
-            let path = events.last().unwrap().project_path.clone();
-            let key = project_key(&path);
-            let mut live = ProjectLive::default();
-            // 从最近 DIALOG_WINDOW 条中恢复，但保持旧→新的运行期顺序。
-            // 单纯 rev().take() 会把上下文倒过来，重启前后提示词语义不一致。
-            for ev in events.iter().rev().take(DIALOG_WINDOW).rev() {
-                let r = serde_json::to_string(ev).unwrap_or_default();
-                live.dialog
-                    .push_back(r.chars().take(DIALOG_MAX_CHARS).collect());
-            }
-            live.events = events.into_iter().collect();
-            if let Some(facts) = crate::memory::load_facts(&entry.path()) {
+
+            if let Some(facts) = crate::memory::load_facts(&project_dir) {
                 live.facts = Some(facts);
+                has_project_data = true;
             }
-            if let Ok(raw) = std::fs::read_to_string(entry.path().join("work-units.json")) {
-                if let Ok(items) = serde_json::from_str::<Vec<crate::workunit::WorkUnit>>(&raw) {
-                    live.work_units = items
-                        .into_iter()
-                        .rev()
-                        .take(crate::workunit::WORKUNIT_KEEP)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
+
+            match crate::cognition_store::load(&project_dir, &key) {
+                Ok(Some(snapshot)) => {
+                    if newest_cognition
+                        .as_ref()
+                        .map(|(newest_ts, _)| snapshot.saved_at > *newest_ts)
+                        .unwrap_or(true)
+                    {
+                        newest_cognition = Some((snapshot.saved_at, key.clone()));
+                    }
+                    restore_cognition(&mut live, snapshot.work_units, snapshot.insights);
+                    has_project_data = true;
+                }
+                Ok(None) => match crate::cognition_store::load_legacy(&project_dir) {
+                    Ok(Some(legacy)) => {
+                        let complete = legacy.is_complete();
+                        let snapshot = legacy.into_snapshot(key.clone());
+                        if newest_cognition
+                            .as_ref()
+                            .map(|(newest_ts, _)| snapshot.saved_at > *newest_ts)
+                            .unwrap_or(true)
+                        {
+                            newest_cognition = Some((snapshot.saved_at, key.clone()));
+                        }
+                        if complete {
+                            match crate::cognition_store::save(&project_dir, &key, &snapshot) {
+                                Ok(path) => log::info!(
+                                    "已迁移 WorkUnit/Insight 到原子快照:{}",
+                                    path.display()
+                                ),
+                                Err(error) => log::error!(
+                                    "迁移项目 {key} 的认知快照失败:{error}；旧文件仍保留"
+                                ),
+                            }
+                        } else {
+                            log::warn!(
+                                "项目 {key} 的旧认知文件不完整；已恢复有效部分，旧文件仍保留"
+                            );
+                        }
+                        restore_cognition(&mut live, snapshot.work_units, snapshot.insights);
+                        has_project_data = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::error!(
+                            "项目 {key} 的旧认知文件无法迁移:{error}；已禁止覆盖以保留恢复机会"
+                        );
+                        state.block_cognition_persistence(&key);
+                    }
+                },
+                Err(error) => {
+                    log::error!("项目 {key} 的权威认知快照损坏或不可读:{error}；已禁止覆盖原文件");
+                    state.block_cognition_persistence(&key);
                 }
             }
-            if let Ok(raw) = std::fs::read_to_string(entry.path().join("insights.json")) {
-                if let Ok(items) = serde_json::from_str::<Vec<crate::insight::Insight>>(&raw) {
-                    live.insights = items
-                        .into_iter()
-                        .rev()
-                        .take(crate::insight::INSIGHT_KEEP)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                }
-            }
-            let ts = live.events.back().map(|e| e.ts).unwrap_or(0);
-            core.projects.insert(key, live);
-            if newest.as_ref().map(|(t, _)| ts > *t).unwrap_or(true) {
-                newest = Some((ts, path));
+
+            if has_project_data {
+                core.projects.insert(key, live);
             }
         }
-        if let Some((_, path)) = newest {
-            core.active_project = Some(project_key(&path));
-        }
+        core.active_project = select_active_project(newest_event, newest_cognition);
     }
 
     drop(core);
     Ok(())
+}
+
+fn select_active_project(
+    newest_event: Option<(i64, String)>,
+    newest_cognition: Option<(i64, String)>,
+) -> Option<String> {
+    // 事件代表用户当前正在工作的项目；只有完全没有可用事件时，才退回到
+    // 最近保存的认知快照，让 cognition-only 项目仍可由列表命令访问。
+    newest_event
+        .or(newest_cognition)
+        .map(|(_, project_key)| project_key)
+}
+
+fn restore_cognition(
+    live: &mut ProjectLive,
+    work_units: Vec<crate::workunit::WorkUnit>,
+    insights: Vec<crate::insight::Insight>,
+) {
+    live.work_units = work_units
+        .into_iter()
+        .rev()
+        .take(crate::workunit::WORKUNIT_KEEP)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    live.insights = insights
+        .into_iter()
+        .rev()
+        .take(crate::insight::INSIGHT_KEEP)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
 }
 
 /// 持久化各文件(在变更点调用;自行加锁)
@@ -730,5 +848,24 @@ mod tests {
         assert_eq!(project_key("C:/proj/foo"), project_key("C:/proj/foo"));
         assert_ne!(project_key("C:/proj/foo"), project_key("C:/proj/bar"));
         assert_eq!(project_key("x").len(), 16);
+    }
+
+    #[test]
+    fn cognition_only_project_remains_selectable_after_restart() {
+        assert_eq!(
+            select_active_project(None, Some((20, "cognition-project".into()))),
+            Some("cognition-project".into())
+        );
+    }
+
+    #[test]
+    fn recent_event_takes_priority_over_snapshot_fallback() {
+        assert_eq!(
+            select_active_project(
+                Some((10, "active-event-project".into())),
+                Some((99, "newer-snapshot-project".into())),
+            ),
+            Some("active-event-project".into())
+        );
     }
 }
