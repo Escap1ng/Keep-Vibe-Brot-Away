@@ -3,6 +3,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api } from "../lib/api";
+import { cardDisplayText, cardKindPresentation } from "../lib/cardPresentation";
 import { DEFAULT_DAILY_BUDGET, PROMPT_PENDING_MARK } from "../lib/types";
 import type {
   BudgetInfo,
@@ -127,19 +128,6 @@ function fmtTime(ts: number) {
   const d = new Date(ts * 1000);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-const insightLabel: Record<string, string> = {
-  explain: "本轮变更",
-  risk: "风险",
-  decision: "待确认",
-  "test-gap": "测试缺口",
-  question: "问题",
-};
-
-function cardKindLabel(card: Card) {
-  if (card.insight) return insightLabel[card.insight.type] ?? "洞察";
-  return card.type === "review" ? "审查" : card.type === "awareness" ? "知情度" : "知识";
 }
 
 /** 相对时间:光给绝对时刻看不出"链路是不是早就断了" */
@@ -306,10 +294,10 @@ onUnmounted(() => {
       <div v-if="!history.length" class="empty">还没有历史记录。回答过的卡片会出现在这里。</div>
       <div v-for="c in history" :key="c.id" class="h-item">
         <div class="h-top">
-          <span class="kvba-chip bb-bauhaus">{{ cardKindLabel(c) }}</span>
+          <span class="kvba-chip bb-bauhaus">{{ cardKindPresentation(c).label }}</span>
           <span class="h-time">{{ fmtTime(c.createdAt) }}</span>
         </div>
-        <p class="h-text">{{ c.text }}</p>
+        <p class="h-text">{{ cardDisplayText(c) }}</p>
         <p v-if="c.insight" class="h-answer">建议：{{ c.insight.suggestedAction }}</p>
         <p class="h-answer">你的答复:{{ c.answer || "—" }}</p>
         <template v-if="c.optimizedPrompt && c.optimizedPrompt !== PROMPT_PENDING_MARK">
