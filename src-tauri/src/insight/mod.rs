@@ -105,15 +105,36 @@ pub fn analyze(work_unit: &WorkUnit, source_events: &[NormalizedEvent]) -> Vec<I
 }
 
 pub fn primary(insights: &[Insight]) -> Option<&Insight> {
-    [
-        InsightType::Risk,
-        InsightType::Decision,
-        InsightType::TestGap,
-        InsightType::Explain,
-        InsightType::Question,
-    ]
-    .into_iter()
-    .find_map(|kind| insights.iter().find(|insight| insight.kind == kind))
+    fn risk_rank(level: RiskLevel) -> u8 {
+        match level {
+            RiskLevel::Info => 0,
+            RiskLevel::P2 => 1,
+            RiskLevel::P1 => 2,
+            RiskLevel::P0 => 3,
+        }
+    }
+    fn kind_rank(kind: InsightType) -> u8 {
+        match kind {
+            InsightType::Risk => 5,
+            InsightType::Decision => 4,
+            InsightType::TestGap => 3,
+            InsightType::Explain => 2,
+            InsightType::Question => 1,
+        }
+    }
+
+    // 严重级别必须先于类型：否则任意启发式 P2 Risk 都会遮住精确的 P1
+    // 测试失败，最终投影到队列的反而是低优先级卡片。
+    insights.iter().max_by(|left, right| {
+        risk_rank(left.risk_level)
+            .cmp(&risk_rank(right.risk_level))
+            .then_with(|| kind_rank(left.kind).cmp(&kind_rank(right.kind)))
+            .then_with(|| {
+                left.confidence
+                    .partial_cmp(&right.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    })
 }
 
 fn change_summary(work_unit: &WorkUnit, source_events: &[NormalizedEvent]) -> Option<Insight> {
@@ -308,7 +329,7 @@ fn event_risk(work_unit: &WorkUnit, events: &[NormalizedEvent]) -> Option<Insigh
     if flagged.iter().any(|event| event.excerpt.todo_or_fixme) {
         signals.push("TODO/FIXME");
     }
-    let evidence = flagged
+    let mut evidence: Vec<Evidence> = flagged
         .iter()
         .take(5)
         .map(|event| Evidence {
@@ -324,6 +345,34 @@ fn event_risk(work_unit: &WorkUnit, events: &[NormalizedEvent]) -> Option<Insigh
             ),
         })
         .collect();
+    // 风险卡后续靠文件引用判断证据是否因再次编辑而失效。此前这里只保留
+    // Event 证据，适配器明明上报了文件，投影到 Card 后 refFiles 仍为空，
+    // 导致 stale 检测永远无法命中。保留事件来源的同时补上去重后的文件证据。
+    for path in flagged
+        .iter()
+        .flat_map(|event| event.excerpt.files.iter())
+        .filter(|path| !path.trim().is_empty())
+    {
+        if evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::File && item.reference.as_str() == path.as_str())
+        {
+            continue;
+        }
+        evidence.push(Evidence {
+            kind: EvidenceKind::File,
+            reference: path.clone(),
+            excerpt: "风险事件关联文件".into(),
+        });
+        if evidence
+            .iter()
+            .filter(|item| item.kind == EvidenceKind::File)
+            .count()
+            >= 5
+        {
+            break;
+        }
+    }
     Some(build_insight(
         work_unit,
         InsightType::Risk,
@@ -543,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn risk_keeps_file_evidence_for_stale_detection() {
+        let mut event = source_event();
+        event.excerpt.has_error_path = true;
+        event.excerpt.files = vec!["src/lib.rs".into(), "src/lib.rs".into()];
+
+        let risk = analyze(&unit(&[], false), &[event])
+            .into_iter()
+            .find(|insight| insight.kind == InsightType::Risk)
+            .expect("风险信号应生成 Insight");
+        let file_evidence = risk
+            .evidence
+            .iter()
+            .filter(|item| item.kind == EvidenceKind::File)
+            .collect::<Vec<_>>();
+        assert_eq!(file_evidence.len(), 1, "重复文件引用应去重");
+        assert_eq!(file_evidence[0].reference, "src/lib.rs");
+    }
+
+    #[test]
     fn insight_contract_round_trips() {
         let insight = analyze(&unit(&["src/lib.rs"], true), &[source_event()])
             .into_iter()
@@ -562,5 +630,32 @@ mod tests {
             &[source_event()],
         );
         assert_eq!(primary(&insights).unwrap().kind, InsightType::Decision);
+    }
+
+    #[test]
+    fn primary_never_hides_p1_behind_p2_risk() {
+        let work_unit = unit(&["src/lib.rs"], false);
+        let mut insights = analyze(&work_unit, &[source_event()]);
+        let test_gap = insights
+            .iter_mut()
+            .find(|insight| insight.kind == InsightType::TestGap)
+            .unwrap();
+        test_gap.risk_level = RiskLevel::P1;
+        insights.push(build_insight(
+            &work_unit,
+            InsightType::Risk,
+            "文本启发式风险".into(),
+            vec![Evidence {
+                kind: EvidenceKind::Event,
+                reference: "event-risk".into(),
+                excerpt: "启发式信号".into(),
+            }],
+            "仅是线索".into(),
+            "人工核对".into(),
+            RiskLevel::P2,
+            0.99,
+        ));
+
+        assert_eq!(primary(&insights).unwrap().kind, InsightType::TestGap);
     }
 }
