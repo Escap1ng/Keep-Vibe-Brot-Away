@@ -29,8 +29,8 @@ pub fn scan_flags(intent: &str, diff: &str) -> SeverityFlags {
 
 /// 取 `keys` 中**最长**的字符串字段(内容/差异常分散在多个字段,最长的最接近正文)。
 ///
-/// 两侧命名都得列:Claude Code 用 snake_case(`new_string`),Trae 用 camelCase
-/// (`newString`)。旧实现只查 camelCase,于是对 Claude 的 Edit 永远取不到 diff
+/// 两种命名都得列:snake_case(`new_string`)与 camelCase(`newString`)。
+/// 旧实现只查 camelCase,于是对 Claude 的 Edit 永远取不到 diff
 /// —— `lineDelta` 恒为 0,G5-A 的"大改 +30"这一路直接哑掉。
 pub fn longest_str(v: &Value, keys: &[&str]) -> String {
     let mut best = String::new();

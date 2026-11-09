@@ -2,14 +2,13 @@
 // 接入:~/.codex/config.toml 里加一行顶层键 notify = ["node", "<本文件绝对路径>"],见同目录 config.sample.toml。
 // 无需编译,装好 Node 即可用。
 //
-// Codex 的 hook 面与 Trae/Claude Code 有三点结构性差异,决定了本脚本的形状:
+// Codex 的 hook 面与 Claude Code 有三点结构性差异,决定了本脚本的形状:
 // 1. **payload 走 argv 而不是 stdin** —— Codex 把 JSON 作为最后一个参数追加到命令上(所以读 process.argv[2])。
 //    为保留"不经宿主包装层自证"的排查路径,argv 为空时回退读 stdin。
 // 2. **只有 agent-turn-complete 一个事件**,没有工具级 hook,也没有"开始"事件。
 //    所以 Codex 这一路**永远只能喂出 turn.ended → 知识分支**,审查分支需要写事件,拿不到。
 //    这是 Codex 的能力边界,不是本脚本的缺陷,不要试图用文本猜测"刚才改了哪些文件"。
-// 3. **不经 shell 直接 exec**:没有管道/&&/变量展开,也**不需要**给带空格的路径加引号
-//    (Trae 那条坑在这里不存在)。
+// 3. **不经 shell 直接 exec**:没有管道/&&/变量展开,也**不需要**给带空格的路径加引号。
 //
 // 铁律:任何情况都以 exit 0 结束,绝不阻断 Codex(notify 本就是 fire-and-forget,stdout/stderr 被丢弃)。
 import { readFileSync } from "node:fs";

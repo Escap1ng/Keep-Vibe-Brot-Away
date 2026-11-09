@@ -96,7 +96,6 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 | Claude Code 主适配器 | 官方 Hooks:PostToolUse/Stop → `kvba-claude-bridge`(Rust 二进制,stdin 收 hook JSON,POST 上报) | Rust |
 | Claude Code 兜底 | 监听 `~/.claude/projects/**/*.jsonl` 增量,解析工具调用与消息(方案 C) | Rust watcher |
 | opencode 适配器 | 官方插件 API,订阅事件(tool.execute.after、message.updated 等),POST 上报 | TS 插件 |
-| Trae 适配器 | Hooks:PostToolUse/Stop → `kvba-trae-hook`(Node 脚本,读 stdin JSON 后 POST 上报;工具名映射为规范小写名,`RunCommand` 不计写事件) | Node 脚本 |
 
 - 适配器向主程序 `POST /kvba/hello` 以本地随机 token 换取事件上报 token;
 - 上报失败重试 3 次后丢弃,绝不影响 Agent;
@@ -108,7 +107,7 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 {
   "schema": "kvba.event.v1",
   "id": "blake3哈希",
-  "emitter": "claude-code-bridge | claude-code-watcher | opencode-plugin | trae-hook",
+  "emitter": "claude-code-bridge | claude-code-watcher | opencode-plugin",
   "eventType": "tool.completed | tool.started | turn.ended | message.updated | session.ended",
   "toolName": "edit | write | patch | think | read | bash | grep | 其他",
   "ts": 0,
@@ -141,7 +140,7 @@ KVBA(Keep-Vibe-Brot-Away)是一个**项目伴读(Project Sidekick)**:
 - 排泄口:① 回答(满意/不满意/自定义) ② 手动跳过 ③ "不再问这类"(写入主题冷却矩阵) ④ TTL 2 小时过期 ⑤ 卡片引用文件后来被 Agent 再次修改 → 自动标记"已过时"退场;
 - 可选(设置项,默认关):severity=P0 的审查卡在队列满时可**替换**最旧一张(总数仍 ≤3)。已实现:`Settings.p0_replace_queue` → `insert_card` 满队列时替换最旧 pending 并归档(被替换卡记为 `dismissed`,有单测覆盖)。
 - 手动按钮"来一道":旁路 G2 频控、G3 活性、G4 路由与 G6 去重,**不破队列上限(G1)**。
-- **开场破冰**:每个会话的首次评估放行一张知识贴士(旁路 G2 间隔/同主题冷却与 G6 近似)。它解决的是"对话一开始必然零输出"——旧口径下 G4 只认写事件与 `turn.ended`,而 Trae/Claude Code 的 `turn.ended` 只在整轮结束时才发,于是第一轮进行中永远不出卡。破冰**不旁路** G1、G3、用户显式静默期与出稿正文护栏,且按 session 记账,一次会话最多一次。
+- **开场破冰**:每个会话的首次评估放行一张知识贴士(旁路 G2 间隔/同主题冷却与 G6 近似)。它解决的是"对话一开始必然零输出"——旧口径下 G4 只认写事件与 `turn.ended`,而 Claude Code 的 `turn.ended` 只在整轮结束时才发,于是第一轮进行中永远不出卡。破冰**不旁路** G1、G3、用户显式静默期与出稿正文护栏,且按 session 记账,一次会话最多一次。
 
 ### 5.2 卡片 Schema
 
@@ -325,8 +324,7 @@ keep-vibe-brot-away/
 │  ├─ claude-code/             # Rust 工程:src/bin/bridge.rs(hook stdin→POST)
 │  │                           #        src/bin/watcher.rs(JSONL 增量兜底,方案C)
 │  │                           #   注意:watcher 是同一 Cargo 工程的第二个 bin,不是独立目录
-│  ├─ opencode-plugin/         # TS 插件(kvba-plugin.ts);.opencode/plugins/ 下为同步副本,CI 校验一致
-│  └─ trae-hook/               # Node 脚本适配器(kvba-trae-hook.mjs + hooks.sample.json)
+│  └─ opencode-plugin/         # TS 插件(kvba-plugin.ts);.opencode/plugins/ 下为同步副本,CI 校验一致
 └─ docs/
 ```
 
@@ -352,12 +350,12 @@ Tauri command/event 清单(实际注册 24 条,勿改同名语义):
 ## 12. 里程碑(严格按序,每个里程碑结束后进行最小功能单元测试自检)
 
 - **M1 骨架**:Tauri2 工程;托盘 + 悬浮胶囊 idle 态(透明置顶圆点、拖拽、边缘吸附、可隐藏为托盘)可运行;
-- **M2 事件摄入**:本地 HTTP 端点;claude-code bridge(含 hooks 配置说明)、opencode TS 插件、Trae hooks(node 脚本)三路适配器上报;events.log 滚动落盘 + emitter 无关内容判重;验收:真实 Agent 会话可见事件入队日志;
+- **M2 事件摄入**:本地 HTTP 端点;claude-code bridge(含 hooks 配置说明)、opencode TS 插件两路适配器上报;events.log 滚动落盘 + emitter 无关内容判重;验收:真实 Agent 会话可见事件入队日志;
 - **M3 决策树**:纯函数+夹具单测(覆盖 G1 满队列、G2 冷却、G4 分支、G5 打分、G6 去重、P0 判定);决策日志面板可看每次评估(含 G7 真实结局);
 - **M4 记忆层**:facts 扫描/首版生成/增量合并;对话滚动窗口;验收:同一项目两次会话记忆连续;
 - **M5 LLM 分析器**:三 provider + SSE + 密钥加密 + 每日预算;契约输出解析与重试(一次分析最多占 1 格额度)、预算耗尽攒批 + 恢复补发;
 - **M6 胶囊交互**:idle/active/popup 状态机全功能;回答/跳过/不再问这类;TTL/过时;"不满意→剪贴板+next-prompt.md";点击穿透保护(**经决策取消**,理由见 §9.2);
-- **M7 打磨**:右键菜单、暂停/恢复、设置/历史面板、单实例、Windows/macOS/Linux 打包;README(安装 + 三路适配器配置说明)。
+- **M7 打磨**:右键菜单、暂停/恢复、设置/历史面板、单实例、Windows/macOS/Linux 打包;README(安装 + 两路适配器配置说明)。
 
 ---
 

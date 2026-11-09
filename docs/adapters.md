@@ -24,7 +24,6 @@ Windows 默认端点文件为：
 | Claude Code Node 钩子 | 是 | 是 | 是 | 异步钩子不保证严格到达顺序；未接 `PostToolUseFailure` |
 | Claude Code Rust bridge | 是 | 是 | 是 | 需要编译；随附样例异步上报且未配置失败/会话结束事件 |
 | Claude Code JSONL watcher | 是 | 否 | 否 | 暂走旧门控兼容路径 |
-| Trae 钩子 | 是 | 是 | 是 | 工具响应文本不等同可靠退出状态 |
 | Codex `notify` | 否 | 是 | 是 | 仅能结合回合结束时 Git 快照，无法提供逐工具证据 |
 
 “自动形成 `WorkUnit`”只表示能够收口回合。当前 `kvba.event.v1` 没有标准执行结果字段，因此识别到的测试命令仍会标记为 `Unknown`。
@@ -115,35 +114,6 @@ node adapters\codex-notify\kvba-codex-hook.mjs '{"type":"agent-turn-complete","t
 
 Codex 当前只提供回合完成通知。KVBA 会在该边界读取 Git 工作区，因此仍可生成基于快照的洞察；但无法知道本轮逐工具操作、测试退出状态或审批等待。
 
-## Trae
-
-复制示例配置：
-
-```powershell
-New-Item -ItemType Directory -Force .trae
-Copy-Item adapters\trae-hook\hooks.sample.json .trae\hooks.json
-```
-
-编辑 `.trae/hooks.json`，把占位符换成脚本的绝对路径。随后：
-
-1. 在 Trae 的“设置 → Hooks”中确认项目钩子已启用。
-2. 新开一个会话；Trae 只在创建会话时读取钩子配置。
-3. 确认命令路径不含空格。当前 Trae 沙箱对带空格路径的引号处理不稳定；可将脚本放到无空格目录，或在 Windows 使用 8.3 短路径且不要添加内层引号。
-
-查找 Windows 短路径：
-
-```powershell
-(New-Object -ComObject Scripting.FileSystemObject).GetFolder("C:\path with spaces\KVBA").ShortPath
-```
-
-手工验证：
-
-```powershell
-$env:KVBA_HOOK_DEBUG = "1"
-'{"hook_event_name":"Stop","session_id":"manual-test","cwd":"C:\\project"}' |
-  node adapters\trae-hook\kvba-trae-hook.mjs
-```
-
 ## 共用故障排查
 
 | 症状 | 检查 | 修复 |
@@ -152,7 +122,6 @@ $env:KVBA_HOOK_DEBUG = "1"
 | 手工脚本显示 `skip/no-endpoint` | 适配器读取的数据目录是否正确 | 清除错误的 `KVBA_DATA_DIR`，或指向主程序真实数据目录 |
 | 脚本显示 `fail/post` | KVBA 是否仍在运行、端口是否已随机化 | 重启 KVBA 后重新执行手工验证 |
 | Claude Code 没有新事件 | 配置是否已加载到新会话、脚本路径引号是否正确 | 新开会话；路径含空格时保留引号 |
-| Trae 显示启用但没执行 | 命令路径是否含空格、是否仍在旧会话 | 使用无空格/短路径并新开会话 |
 | Codex 没有通知 | `notify` 是否处于 TOML 顶层、Node.js 是否可见 | 移到文件顶层并改用 Node.js 绝对路径 |
 
 Windows 运行日志位于 `%LOCALAPPDATA%\dev.kvba.app\logs\KVBA.log`。适配器不向 Agent 显示错误时，以手工验证输出和该日志共同判断。

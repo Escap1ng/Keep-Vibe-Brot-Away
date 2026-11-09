@@ -256,8 +256,7 @@ onUnmounted(() => {
         <div class="row static">
           <span>事件链路</span>
           <span v-if="!stats?.eventsIngested" class="warn">
-            本次运行 0 条 —— 适配器未接入。Trae 需 设置 &gt; Hooks 里启用项目 Hook
-            (配置文件 .trae/hooks.json)并新开一个会话
+            本次运行 0 条 —— 适配器未接入。检查适配器配置是否生效,并新开一个 Agent 会话
           </span>
           <span v-else-if="eventStale" class="warn">
             本次运行 {{ stats.eventsIngested }} 条,最近 {{ fmtAgo(stats.lastEventIn!) }}

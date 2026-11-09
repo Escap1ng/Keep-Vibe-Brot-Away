@@ -37,11 +37,6 @@ jobs:
       - name: opencode 插件副本必须与源文件一致
         run: cmp adapters/opencode-plugin/kvba-plugin.ts .opencode/plugins/kvba-plugin.ts
 
-      - name: Trae hook 语法与配置模板校验
-        run: |
-          node --check adapters/trae-hook/kvba-trae-hook.mjs
-          node -e "JSON.parse(require('fs').readFileSync('adapters/trae-hook/hooks.sample.json','utf8'))"
-
       - name: 类型检查与构建
         run: npm run build
 
