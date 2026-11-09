@@ -107,6 +107,22 @@ body.label-settings {
   overflow-y: auto;
 }
 
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--md-outline-variant);
+  border-radius: var(--r-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--md-outline);
+}
+
 /* ---------- 键盘可达性 ---------- */
 :focus-visible {
   outline: 2px solid var(--md-secondary);

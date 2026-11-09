@@ -164,7 +164,9 @@ onUnmounted(() => {
       @pointerleave="hovered = false"
     >
       <!-- 包豪斯三角标(品牌记号) -->
-      <span class="dot-mark"></span>
+      <svg class="dot-mark" viewBox="0 0 16 12" aria-hidden="true">
+        <path d="M1 1h14L8 11z" fill="var(--on-primary)" />
+      </svg>
       <span v-if="pendingCount > 0" class="dot-badge">{{ pendingCount > 9 ? "9+" : pendingCount }}</span>
     </div>
   </div>
@@ -202,11 +204,9 @@ onUnmounted(() => {
 
 /* 包豪斯记号:倒三角 */
 .dot-mark {
-  width: 0;
-  height: 0;
-  border-left: 8px solid transparent;
-  border-right: 8px solid transparent;
-  border-top: 11px solid var(--on-primary);
+  width: 16px;
+  height: 12px;
+  display: block;
   transition: transform var(--dur-3) var(--ease-out);
 }
 .kvba-dot.hovered .dot-mark {
@@ -222,11 +222,11 @@ onUnmounted(() => {
   padding: 0 5px;
   border-radius: var(--r-full);
   background: var(--bb-gold);
-  border: 1.5px solid var(--md-surface);
-  color: #2d1800;
+  border: 2px solid var(--md-surface);
+  color: var(--on-tertiary-container);
   font-size: 11px;
   font-weight: 600;
-  line-height: 15px;
+  line-height: 14px;
   text-align: center;
   box-shadow: var(--shadow-1);
 }
