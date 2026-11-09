@@ -668,6 +668,7 @@ mod tests {
                 todo_or_fixme: todo,
                 line_delta,
             },
+            execution: None,
         }
     }
 

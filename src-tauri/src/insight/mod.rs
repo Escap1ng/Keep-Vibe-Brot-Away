@@ -277,6 +277,33 @@ fn test_gap(work_unit: &WorkUnit) -> Option<Insight> {
         ));
     }
 
+    let failed: Vec<_> = work_unit
+        .tests
+        .iter()
+        .filter(|test| test.status == TestStatus::Failed)
+        .collect();
+    if !failed.is_empty() {
+        let evidence = failed
+            .iter()
+            .take(5)
+            .map(|test| Evidence {
+                kind: EvidenceKind::Test,
+                reference: test.evidence.clone(),
+                excerpt: test.name.clone(),
+            })
+            .collect();
+        return Some(build_insight(
+            work_unit,
+            InsightType::TestGap,
+            format!("捕获到 {} 条以非零退出码结束的测试命令。", failed.len()),
+            evidence,
+            "退出码是可靠的执行结果，但测试失败本身不自动代表高风险。".into(),
+            "查看失败输出并修复后重新运行；不要仅凭一次失败提升风险级别。".into(),
+            RiskLevel::P2,
+            0.9,
+        ));
+    }
+
     if work_unit
         .tests
         .iter()
@@ -296,10 +323,10 @@ fn test_gap(work_unit: &WorkUnit) -> Option<Insight> {
         return Some(build_insight(
             work_unit,
             InsightType::TestGap,
-            "捕获到测试命令，但 kvba.event.v1 没有退出状态，测试结果仍未验证。".into(),
+            "捕获到测试命令，但没有可靠的退出状态，测试结果仍未验证。".into(),
             evidence,
             "工具调用完成不能作为测试通过的证据。".into(),
-            "扩展事件协议记录退出状态，或人工核对本次测试输出。".into(),
+            "让适配器提供带来源的执行记录，或人工核对本次测试输出。".into(),
             RiskLevel::P2,
             0.98,
         ));
@@ -541,6 +568,7 @@ mod tests {
             } else {
                 vec![]
             },
+            executions: vec![],
         }
     }
 
@@ -555,6 +583,7 @@ mod tests {
             project_path: "C:/repo".into(),
             session_id: "session".into(),
             excerpt: Excerpt::default(),
+            execution: None,
         }
     }
 
@@ -581,6 +610,20 @@ mod tests {
             .unwrap();
         assert!(gap.conclusion.contains("未捕获测试命令"));
         assert_eq!(gap.risk_level, RiskLevel::P2);
+    }
+
+    #[test]
+    fn failed_test_is_p2_with_execution_evidence() {
+        let mut work_unit = unit(&["src/lib.rs"], true);
+        work_unit.tests[0].status = TestStatus::Failed;
+        let insights = analyze(&work_unit, &[source_event()]);
+        let gap = insights
+            .iter()
+            .find(|insight| insight.kind == InsightType::TestGap)
+            .expect("failed test should produce a test-gap insight");
+        assert_eq!(gap.risk_level, RiskLevel::P2);
+        assert_eq!(gap.evidence[0].reference, "event-test");
+        assert!(gap.conclusion.contains("非零退出码"));
     }
 
     #[test]

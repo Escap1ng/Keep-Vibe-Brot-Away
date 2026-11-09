@@ -36,7 +36,14 @@ pub const EVENT_TYPES: &[&str] = &[
     "session.ended",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub const MAX_COMMAND_CHARS: usize = 2000;
+pub const MAX_OUTPUT_CHARS: usize = 2000;
+pub const MAX_OUTPUT_REF_CHARS: usize = 1024;
+
+/// 只有这两种来源的 exit_code 才能推出测试结果;`unknown` 一律保持 Unknown。
+pub const RELIABLE_RESULT_SOURCES: &[&str] = &["transcript", "adapter"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Excerpt {
     pub files: Vec<String>,
@@ -46,6 +53,25 @@ pub struct Excerpt {
     pub has_api_call: bool,
     pub todo_or_fixme: bool,
     pub line_delta: i64,
+}
+
+/// 一次命令执行的独立证据。`kvba.event.v1` 的可选扩展:旧事件没有该字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutionEvidence {
+    /// 幂等键:适配器提供的执行/工具调用 ID;缺失时由服务端生成。
+    pub id: String,
+    pub command: String,
+    pub cwd: String,
+    /// 秒级时间戳;拿不到开始时间时等于结束时间。
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub exit_code: Option<i32>,
+    /// transcript / adapter / unknown。unknown 不得携带 exit_code。
+    pub result_source: String,
+    /// 输出证据定位符,例如 `<transcript>#<tool_use_id>`。
+    pub output_ref: String,
+    pub output_excerpt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,6 +86,8 @@ pub struct NormalizedEvent {
     pub project_path: String,
     pub session_id: String,
     pub excerpt: Excerpt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionEvidence>,
 }
 
 impl NormalizedEvent {
@@ -95,6 +123,38 @@ impl NormalizedEvent {
         self.emitter = self.emitter.chars().take(48).collect();
         self.session_id = self.session_id.chars().take(96).collect();
 
+        if let Some(mut exec) = self.execution.take() {
+            let fallback_id = hash_event(&self);
+            exec.command = truncate_chars(exec.command.trim(), MAX_COMMAND_CHARS);
+            exec.cwd = exec.cwd.trim().chars().take(512).collect();
+            exec.output_ref = exec.output_ref.chars().take(MAX_OUTPUT_REF_CHARS).collect();
+            exec.output_excerpt = truncate_chars(&exec.output_excerpt, MAX_OUTPUT_CHARS);
+            exec.started_at = normalize_seconds(exec.started_at);
+            exec.ended_at = normalize_seconds(exec.ended_at);
+            if exec.ended_at <= 0 {
+                exec.ended_at = self.ts;
+            }
+            if exec.started_at <= 0 {
+                exec.started_at = exec.ended_at;
+            }
+            if !RELIABLE_RESULT_SOURCES.contains(&exec.result_source.as_str()) {
+                exec.result_source = "unknown".into();
+            }
+            // 没有可靠来源就不能携带退出码,否则会把 Unknown 伪装成已判定
+            if exec.result_source == "unknown" {
+                exec.exit_code = None;
+            }
+            if exec.id.trim().is_empty() {
+                exec.id = format!("exec-{fallback_id}");
+            } else {
+                exec.id = exec.id.chars().take(96).collect();
+            }
+            // 没有命令文本不算一次命令执行
+            if !exec.command.is_empty() {
+                self.execution = Some(exec);
+            }
+        }
+
         // id:缺失时用 blake3 确定性生成
         if self.id.trim().is_empty() {
             self.id = hash_event(&self);
@@ -112,12 +172,14 @@ pub fn hash_event(e: &NormalizedEvent) -> String {
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
 
-/// **emitter 无关**的内容指纹:project|eventType|tool|intent|文件名|事件秒。
+/// **emitter 无关**的内容指纹:project|eventType|tool|intent|文件名|事件秒|执行ID。
 /// 刻意不含 id / emitter / diff 正文，但包含规范化 Agent 家族与 session：同一
 /// Claude 会话的 bridge/hook/watcher 仍可合并，不同 Agent 或并发会话不会互相
 /// 吞掉工具与测试证据。session 缺失时只能退化到 Agent 家族；边界再使用精确
 /// emitter，避免两个无 session 的适配器互相吞掉收口信号。
 /// 文件名只取 basename,避免一边给绝对路径、一边给相对路径。
+/// 有执行 ID 时把它纳入指纹：同一命令的两次真实执行不再被 5 秒窗口误判为重复，
+/// 同一执行的重传仍然合并。
 pub fn content_fingerprint(e: &NormalizedEvent) -> String {
     let mut files: Vec<&str> = e.excerpt.files.iter().map(|f| base_name(f)).collect();
     files.sort_unstable();
@@ -136,16 +198,28 @@ pub fn content_fingerprint(e: &NormalizedEvent) -> String {
     } else {
         String::new()
     };
+    let execution_identity = e
+        .execution
+        .as_ref()
+        .map(|exec| exec.id.as_str())
+        .unwrap_or("");
+    // 有执行 ID 时不再用事件秒区分：同一执行的重传可能带不同时间戳，仍应合并。
+    let timestamp_identity = if execution_identity.is_empty() {
+        e.ts.to_string()
+    } else {
+        String::new()
+    };
     let seed = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         e.project_path,
         e.event_type,
         e.tool_name,
         e.excerpt.intent,
         files.join(","),
-        e.ts,
+        timestamp_identity,
         event_identity,
-        boundary_identity
+        boundary_identity,
+        execution_identity
     );
     blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
 }
@@ -174,6 +248,14 @@ pub fn seen_or_record(buf: &mut VecDeque<(i64, String)>, ts: i64, fp: &str) -> b
 
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+fn normalize_seconds(ts: i64) -> i64 {
+    if ts > 1_000_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
 }
 
 /// 事件存储:内存窗口 + JSONL 滚动落盘(无实例状态,全部为关联函数)
@@ -276,6 +358,7 @@ mod tests {
                 intent: intent.into(),
                 ..Default::default()
             },
+            execution: None,
         }
     }
 
@@ -400,5 +483,85 @@ mod tests {
             "超窗后应重新放行"
         );
         assert_eq!(buf.len(), 1, "过期条目应被清掉");
+    }
+
+    #[test]
+    fn content_fingerprint_separates_execution_ids() {
+        let mut first = ev("bridge", "1", "bash", "cargo test", &[], 1000);
+        first.execution = Some(ExecutionEvidence {
+            id: "call-1".into(),
+            command: "cargo test".into(),
+            ..Default::default()
+        });
+        let retransmitted = first.clone();
+        let mut retransmitted_late = first.clone();
+        retransmitted_late.ts = 1001;
+        let mut second_run = first.clone();
+        second_run.execution = Some(ExecutionEvidence {
+            id: "call-2".into(),
+            command: "cargo test".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            content_fingerprint(&first),
+            content_fingerprint(&retransmitted),
+            "同一执行的重传应合并"
+        );
+        assert_eq!(
+            content_fingerprint(&first),
+            content_fingerprint(&retransmitted_late),
+            "重传时间戳不同也应合并"
+        );
+        assert_ne!(
+            content_fingerprint(&first),
+            content_fingerprint(&second_run),
+            "不同执行 ID 不应被当成重复"
+        );
+    }
+
+    #[test]
+    fn execution_from_unreliable_source_drops_exit_code() {
+        let mut event = ev("bridge", "1", "bash", "cargo test", &[], 1000);
+        event.execution = Some(ExecutionEvidence {
+            id: "call-1".into(),
+            command: "cargo test".into(),
+            exit_code: Some(1),
+            result_source: "guess".into(),
+            ..Default::default()
+        });
+        let exec = event.sanitize().unwrap().execution.unwrap();
+        assert_eq!(exec.result_source, "unknown");
+        assert_eq!(exec.exit_code, None);
+        assert_eq!(exec.id, "call-1");
+    }
+
+    #[test]
+    fn execution_without_command_is_dropped() {
+        let mut event = ev("bridge", "1", "bash", "cargo test", &[], 1000);
+        event.execution = Some(ExecutionEvidence {
+            id: "call-1".into(),
+            command: "  ".into(),
+            exit_code: Some(0),
+            result_source: "transcript".into(),
+            ..Default::default()
+        });
+        assert!(event.sanitize().unwrap().execution.is_none());
+    }
+
+    #[test]
+    fn execution_timestamps_are_normalized_and_filled() {
+        let mut event = ev("bridge", "1", "bash", "cargo test", &[], 1000);
+        event.execution = Some(ExecutionEvidence {
+            id: "call-1".into(),
+            command: "cargo test".into(),
+            started_at: 0,
+            ended_at: 1_700_000_000_000,
+            exit_code: Some(0),
+            result_source: "transcript".into(),
+            ..Default::default()
+        });
+        let exec = event.sanitize().unwrap().execution.unwrap();
+        assert_eq!(exec.ended_at, 1_700_000_000);
+        assert_eq!(exec.started_at, 1_700_000_000);
     }
 }

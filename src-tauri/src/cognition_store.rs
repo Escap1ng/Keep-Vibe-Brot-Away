@@ -427,6 +427,7 @@ mod tests {
             events: vec!["event-1".into()],
             change_set: ChangeSet::default(),
             tests: Vec::new(),
+            executions: Vec::new(),
         }
     }
 

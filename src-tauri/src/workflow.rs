@@ -209,6 +209,7 @@ mod tests {
                 intent: intent.into(),
                 ..Default::default()
             },
+            execution: None,
         }
     }
 

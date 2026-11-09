@@ -209,10 +209,16 @@ function readExecution(transcriptPath, rawToolName) {
         if (block?.type !== "tool_result") continue;
         const name = useNames.get(block.tool_use_id);
         if (!name || String(name).toLowerCase() !== wanted) continue;
+        const endedAt = Date.parse(str(r.timestamp));
         return {
+          toolUseId: str(block.tool_use_id),
           exitCode: typeof result.exitCode === "number" ? result.exitCode : null,
           interrupted: result.interrupted === true,
           signal: typeof result.signal === "string" ? result.signal : null,
+          endedAt: Number.isFinite(endedAt) ? Math.floor(endedAt / 1000) : null,
+          output: [str(result.stderr), str(result.stdout)]
+            .filter(Boolean)
+            .join("\n"),
         };
       }
     }
@@ -316,17 +322,40 @@ function normalize(hook) {
       const isShell = tool === "bash";
 
       let hasError = flags.hasErrorPath;
+      const exec = failed ? null : readExecution(hook.transcript_path, rawTool);
       if (failed) {
         hasError = true;
-      } else {
+      } else if (exec && typeof exec.exitCode === "number") {
         // 有结构化退出码就以它为准;拿不到才退回文本关键词(只是风险信号,不是退出状态)
-        const exec = readExecution(hook.transcript_path, rawTool);
-        if (exec && typeof exec.exitCode === "number") {
-          hasError = exec.exitCode !== 0 || exec.interrupted === true;
-        } else {
-          hasError = hasError || /error|failed|exception|panic/i.test(respText);
-        }
+        hasError = exec.exitCode !== 0 || exec.interrupted === true;
+      } else {
+        hasError = hasError || /error|failed|exception|panic/i.test(respText);
       }
+
+      const command = longestOf(input, ["command", "cmd"]);
+      const nowSeconds = Math.floor(base.ts / 1000);
+      const execution = command
+        ? {
+            id:
+              str(hook.tool_use_id) ||
+              exec?.toolUseId ||
+              fnv16(`qoder-exec|${base.ts}|${intent.slice(0, 40)}`),
+            command,
+            cwd: str(input.dir_path) || projectPath,
+            startedAt: exec?.endedAt ?? nowSeconds,
+            endedAt: exec?.endedAt ?? nowSeconds,
+            exitCode:
+              exec && typeof exec.exitCode === "number" ? exec.exitCode : null,
+            resultSource:
+              exec && typeof exec.exitCode === "number" ? "transcript" : "unknown",
+            outputRef: exec?.toolUseId
+              ? `${str(hook.transcript_path)}#${exec.toolUseId}`
+              : "",
+            outputExcerpt: String(
+              exec?.output || (failed ? respText : ""),
+            ).slice(0, 2000),
+          }
+        : undefined;
 
       return {
         ...base,
@@ -337,6 +366,7 @@ function normalize(hook) {
         ),
         eventType: "tool.completed",
         toolName: tool,
+        execution,
         excerpt: {
           files,
           diffHead: (failed ? respText : diff || respText).slice(0, MAX_DIFF_CHARS),

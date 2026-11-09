@@ -5,7 +5,7 @@
 
 pub mod git;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,22 @@ pub struct TestResult {
     pub evidence: String,
 }
 
+/// 一次命令执行的独立记录，按执行 ID 去重（不是按命令文本）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutionRecord {
+    pub id: String,
+    pub command: String,
+    pub cwd: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub exit_code: Option<i32>,
+    pub result_source: String,
+    pub output_ref: String,
+    pub output_excerpt: String,
+    pub event_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkUnit {
@@ -94,6 +110,9 @@ pub struct WorkUnit {
     pub events: Vec<String>,
     pub change_set: ChangeSet,
     pub tests: Vec<TestResult>,
+    /// v1 可选扩展；旧快照没有该字段时按空列表读取。
+    #[serde(default)]
+    pub executions: Vec<ExecutionRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +209,7 @@ pub fn aggregate_at_boundary(
             events: source_events.iter().map(|event| event.id.clone()).collect(),
             change_set: ChangeSet::default(),
             tests: extract_tests(&source_events),
+            executions: extract_executions(&source_events),
         },
         project_path: boundary.project_path.clone(),
         boundary_event_id: boundary.id.clone(),
@@ -222,30 +242,101 @@ fn is_generic_boundary_intent(intent: &str) -> bool {
         || intent.starts_with("会话结束(")
 }
 
+const TEST_COMMAND_MARKERS: &[&str] = &[
+    "cargo test",
+    "npm test",
+    "npm run test",
+    "pnpm test",
+    "yarn test",
+    "pytest",
+    "python -m unittest",
+    "go test",
+    "dotnet test",
+    "mvn test",
+    "gradle test",
+];
+
+fn is_test_command(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    TEST_COMMAND_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// 每条执行记录都保留，只按执行 ID 去重；重传同一执行不会变成两次运行。
+fn extract_executions(events: &[NormalizedEvent]) -> Vec<ExecutionRecord> {
+    let mut seen = HashSet::new();
+    let mut records = Vec::new();
+    for event in events {
+        let Some(exec) = event.execution.as_ref() else {
+            continue;
+        };
+        if exec.command.trim().is_empty() {
+            continue;
+        }
+        let id = if exec.id.trim().is_empty() {
+            event.id.clone()
+        } else {
+            exec.id.clone()
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        records.push(ExecutionRecord {
+            id,
+            command: exec.command.clone(),
+            cwd: exec.cwd.clone(),
+            started_at: exec.started_at,
+            ended_at: exec.ended_at,
+            exit_code: exec.exit_code,
+            result_source: exec.result_source.clone(),
+            output_ref: exec.output_ref.clone(),
+            output_excerpt: exec.output_excerpt.clone(),
+            event_id: event.id.clone(),
+        });
+    }
+    records
+}
+
+fn evidence_status(exec: &crate::events::ExecutionEvidence) -> TestStatus {
+    if !crate::events::RELIABLE_RESULT_SOURCES.contains(&exec.result_source.as_str()) {
+        return TestStatus::Unknown;
+    }
+    match exec.exit_code {
+        Some(0) => TestStatus::Passed,
+        Some(_) => TestStatus::Failed,
+        None => TestStatus::Unknown,
+    }
+}
+
 fn extract_tests(events: &[NormalizedEvent]) -> Vec<TestResult> {
-    let mut tests = BTreeMap::<String, TestResult>::new();
+    let mut tests = Vec::new();
+    let mut seen = HashSet::new();
     for event in events {
         if event.event_type != "tool.completed" {
             continue;
         }
+        if let Some(exec) = event.execution.as_ref() {
+            if exec.command.trim().is_empty() {
+                continue;
+            }
+            if !seen.insert(exec.id.clone()) {
+                continue;
+            }
+            if !is_test_command(&exec.command) {
+                continue;
+            }
+            tests.push(TestResult {
+                name: truncate_chars(exec.command.trim(), 160),
+                status: evidence_status(exec),
+                evidence: event.id.clone(),
+            });
+            continue;
+        }
+
+        // 旧协议事件没有执行证据：每条事件算一次运行，结果保持 Unknown。
         let text = format!("{} {}", event.excerpt.intent, event.excerpt.diff_head);
-        let lower = text.to_ascii_lowercase();
-        let is_test = [
-            "cargo test",
-            "npm test",
-            "npm run test",
-            "pnpm test",
-            "yarn test",
-            "pytest",
-            "python -m unittest",
-            "go test",
-            "dotnet test",
-            "mvn test",
-            "gradle test",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
-        if !is_test {
+        if !is_test_command(&text) {
             continue;
         }
         let name = truncate_chars(event.excerpt.intent.trim(), 160);
@@ -254,15 +345,13 @@ fn extract_tests(events: &[NormalizedEvent]) -> Vec<TestResult> {
         } else {
             name
         };
-        tests.entry(name.clone()).or_insert(TestResult {
+        tests.push(TestResult {
             name,
-            // kvba.event.v1 has no process exit status. A completed tool call
-            // is not evidence that the command itself passed.
             status: TestStatus::Unknown,
             evidence: event.id.clone(),
         });
     }
-    tests.into_values().collect()
+    tests
 }
 
 pub fn changes_from_events(events: &[NormalizedEvent], git_error: Option<String>) -> ChangeSet {
@@ -322,6 +411,7 @@ mod tests {
                 intent: intent.into(),
                 ..Default::default()
             },
+            execution: None,
         }
     }
 
@@ -435,5 +525,102 @@ mod tests {
         let completed =
             aggregate_at_boundary(&VecDeque::from([claude, opencode, boundary]), "end").unwrap();
         assert_eq!(completed.work_unit.events, vec!["opencode", "end"]);
+    }
+
+    fn exec_event(
+        id: &str,
+        session: &str,
+        ts: i64,
+        command: &str,
+        exec_id: &str,
+        exit_code: Option<i32>,
+        source: &str,
+    ) -> NormalizedEvent {
+        let mut event = event(id, "tool.completed", session, ts, &format!("$ {command}"));
+        event.execution = Some(crate::events::ExecutionEvidence {
+            id: exec_id.into(),
+            command: command.into(),
+            cwd: "C:/repo/app".into(),
+            started_at: ts,
+            ended_at: ts,
+            exit_code,
+            result_source: source.into(),
+            output_ref: format!("transcript#{exec_id}"),
+            output_excerpt: "test output".into(),
+        });
+        event
+    }
+
+    #[test]
+    fn keeps_every_execution_and_derives_status_from_exit_code() {
+        let events = VecDeque::from([
+            exec_event("e1", "a", 10, "cargo test", "call-1", Some(1), "transcript"),
+            exec_event("e2", "a", 11, "cargo test", "call-2", Some(0), "transcript"),
+            event("end", "turn.ended", "a", 12, "回合结束"),
+        ]);
+        let completed = aggregate_at_boundary(&events, "end").unwrap();
+        assert_eq!(completed.work_unit.executions.len(), 2);
+        assert_eq!(completed.work_unit.tests.len(), 2);
+        assert_eq!(completed.work_unit.tests[0].status, TestStatus::Failed);
+        assert_eq!(completed.work_unit.tests[1].status, TestStatus::Passed);
+        assert_eq!(completed.work_unit.tests[0].evidence, "e1");
+        assert_eq!(
+            completed.work_unit.executions[0].output_ref,
+            "transcript#call-1"
+        );
+    }
+
+    #[test]
+    fn duplicate_execution_id_is_deduped() {
+        let events = VecDeque::from([
+            exec_event("e1", "a", 10, "cargo test", "call-1", Some(1), "transcript"),
+            exec_event(
+                "e1-retry",
+                "a",
+                11,
+                "cargo test",
+                "call-1",
+                Some(1),
+                "transcript",
+            ),
+            event("end", "turn.ended", "a", 12, "回合结束"),
+        ]);
+        let completed = aggregate_at_boundary(&events, "end").unwrap();
+        assert_eq!(completed.work_unit.executions.len(), 1);
+        assert_eq!(completed.work_unit.tests.len(), 1);
+    }
+
+    #[test]
+    fn unreliable_source_never_claims_a_result() {
+        let events = VecDeque::from([
+            exec_event("e1", "a", 10, "cargo test", "call-1", Some(0), "unknown"),
+            event("end", "turn.ended", "a", 11, "回合结束"),
+        ]);
+        let completed = aggregate_at_boundary(&events, "end").unwrap();
+        assert_eq!(completed.work_unit.executions.len(), 1);
+        assert_eq!(completed.work_unit.tests[0].status, TestStatus::Unknown);
+    }
+
+    #[test]
+    fn legacy_event_without_execution_stays_unknown() {
+        let events = VecDeque::from([
+            event("t1", "tool.completed", "a", 10, "cargo test"),
+            event("end", "turn.ended", "a", 11, "回合结束"),
+        ]);
+        let completed = aggregate_at_boundary(&events, "end").unwrap();
+        assert!(completed.work_unit.executions.is_empty());
+        assert_eq!(completed.work_unit.tests.len(), 1);
+        assert_eq!(completed.work_unit.tests[0].status, TestStatus::Unknown);
+    }
+
+    #[test]
+    fn old_workunit_json_without_executions_still_loads() {
+        let json = r#"{
+            "id": "wu_1", "projectId": "proj_1", "sessionId": "s1", "goal": "g",
+            "mode": "control", "startAt": 1, "endAt": 2, "events": [],
+            "changeSet": {"files": [], "scope": "unavailable"}, "tests": []
+        }"#;
+        let unit: WorkUnit = serde_json::from_str(json).unwrap();
+        assert!(unit.executions.is_empty());
     }
 }

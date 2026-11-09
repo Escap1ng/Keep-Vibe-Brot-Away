@@ -25,9 +25,9 @@ Windows 默认端点文件为：
 | Claude Code Rust bridge | 是 | 是 | 是 | 需要编译；随附样例异步上报且未配置失败/会话结束事件 |
 | Claude Code JSONL watcher | 是 | 否 | 否 | 暂走旧门控兼容路径 |
 | Codex `notify` | 否 | 是 | 是 | 仅能结合回合结束时 Git 快照，无法提供逐工具证据 |
-| Qoder 钩子 | 是 | 是 | 是 | `tool_response` 为字符串；退出码读自会话转录，v1 协议尚不携带 |
+| Qoder 钩子 | 是 | 是 | 是 | 从会话转录补充 `execution`（含退出码）；转录缺失时保持 `Unknown` |
 
-“自动形成 `WorkUnit`”只表示能够收口回合。当前 `kvba.event.v1` 没有标准执行结果字段，因此识别到的测试命令仍会标记为 `Unknown`。
+“自动形成 `WorkUnit`”只表示能够收口回合。`kvba.event.v1` 的 `execution` 是可选字段：只有提供可靠退出码的来源才能得到 `Passed` / `Failed`，其余测试命令仍标记为 `Unknown`。
 
 ## opencode
 
@@ -141,7 +141,7 @@ $env:KVBA_HOOK_DRY_RUN = "1"
 
 输出一行归一化事件即正常；去掉 `KVBA_HOOK_DRY_RUN` 后会读取 `endpoint.json` 并上报。
 
-能力边界：IDE 的 `PostToolUse.tool_response` 是字符串。适配器会从 `transcript_path` 指向的会话 JSONL 里匹配本次调用（`tool_use` → `tool_result` → `toolUseResult.exitCode`），只用退出码判定 `hasErrorPath`；`kvba.event.v1` 没有执行结果字段，测试状态仍为 `Unknown`（见阶段一的协议扩展）。
+能力边界：IDE 的 `PostToolUse.tool_response` 是字符串。适配器会从 `transcript_path` 指向的会话 JSONL 里匹配本次调用（`tool_use` → `tool_result` → `toolUseResult.exitCode`），把执行 ID、命令、cwd、退出码、输出定位与摘录写入事件的 `execution` 字段；匹配不到时来源记为 `unknown`、退出码留空，测试状态保持 `Unknown`。其余适配器尚未提供该字段。
 
 ## 共用故障排查
 

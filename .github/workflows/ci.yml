@@ -41,6 +41,7 @@ jobs:
           node --check adapters/qoder-hook/kvba-qoder-hook.mjs
           node --check adapters/qoder-hook/install-settings.mjs
           node -e "for (const f of ['adapters/claude-code-hook/hooks.sample.json','adapters/qoder-hook/hooks.sample.json']) JSON.parse(require('fs').readFileSync(f,'utf8'))"
+          node -e "const {execFileSync}=require('child_process');const out=execFileSync(process.execPath,['adapters/qoder-hook/kvba-qoder-hook.mjs'],{input:JSON.stringify({hook_event_name:'PostToolUse',session_id:'ci',cwd:process.cwd(),tool_name:'Bash',tool_input:{command:'cargo test'},tool_response:'',transcript_path:'adapters/qoder-hook/fixtures/transcript.jsonl'}),env:{...process.env,KVBA_HOOK_DRY_RUN:'1'}}).toString();const ev=JSON.parse(out);if(ev.execution?.exitCode!==1||ev.execution?.resultSource!=='transcript')throw new Error('execution evidence missing');"
 
       - name: 类型检查与构建
         run: npm run build

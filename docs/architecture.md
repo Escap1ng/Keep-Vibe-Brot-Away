@@ -59,7 +59,11 @@ Git 证据是“边界到达时，工作区相对 `HEAD` 的快照”，不是�
 - 共享工作区中的变化不能可靠归因给当前 Agent。
 - Git 采集失败或工作区干净时，可退回 Agent 声明的文件证据，并显式保留不完整状态。
 
-测试证据当前只有命令文本。`kvba.event.v1` 没有统一的退出码或结果字段，适配器对响应文本的错误启发式也不能充当权威状态，因此 `TestResult.status` 记为 `Unknown`。
+测试证据现在有两条路径：
+
+- `kvba.event.v1` 的可选 `execution` 字段携带执行 ID、命令、cwd、起止时间、退出码、结果来源与输出定位。每条执行独立保留，按执行 ID 去重。
+- 只有来源可信（`transcript` / `adapter`）且退出码存在时，`TestResult.status` 才会是 `Passed` / `Failed`；缺失来源或退出码时保持 `Unknown`。
+- 没有 `execution` 的旧事件仍按命令文本识别测试，状态为 `Unknown`。当前 Qoder 适配器提供该字段，其余来源显式保持未知。
 
 ### 4. Insight 生成
 
