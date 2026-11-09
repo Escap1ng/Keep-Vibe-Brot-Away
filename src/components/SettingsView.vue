@@ -187,11 +187,12 @@ onUnmounted(() => {
     </nav>
 
     <!-- 设置 -->
-    <section v-if="tab === 'settings'" class="scroller">
+    <section v-if="tab === 'settings'" class="pane">
+      <div class="scroller">
       <div v-if="!s" class="empty">正在载入设置…</div>
       <div v-else class="form-body">
-      <fieldset class="group">
-        <legend>模型(直连用户自配 API,密钥本地加密)</legend>
+      <section class="group">
+        <h2 class="group-title">模型(直连用户自配 API,密钥本地加密)</h2>
         <label class="row">
           <span>Provider</span>
           <select v-model="s!.provider" class="ctrl">
@@ -220,10 +221,10 @@ onUnmounted(() => {
         <p class="hint" v-if="keyStatus.length">
           已配置:{{ keyStatus.join("、") }}
         </p>
-      </fieldset>
+      </section>
 
-      <fieldset class="group">
-        <legend>成本与行为</legend>
+      <section class="group">
+        <h2 class="group-title">成本与行为</h2>
         <label class="row">
           <span>每日 LLM 调用上限</span>
           <input
@@ -248,10 +249,10 @@ onUnmounted(() => {
           <input v-model="s!.p0ReplaceQueue" type="checkbox" class="switch" />
           <span class="hint">(默认关)</span>
         </label>
-      </fieldset>
+      </section>
 
-      <fieldset class="group">
-        <legend>运行状态</legend>
+      <section class="group">
+        <h2 class="group-title">运行状态</h2>
         <div class="row static"><span>本地端点</span><code>{{ endpoint }}</code></div>
         <div class="row static">
           <span>事件链路</span>
@@ -278,13 +279,13 @@ onUnmounted(() => {
         <div class="row static"><span>出稿来源</span><span>本地证据 {{ stats?.cardsEvidence ?? 0 }} · LLM {{ stats?.cardsLlm ?? 0 }} · 模板兜底 {{ stats?.cardsTemplate ?? 0 }}<template v-if="(stats?.cardsTemplate ?? 0) > 0"> · LLM 链路异常,详见日志与决策日志</template></span></div>
         <div class="row static"><span>累计</span><span>发卡 {{ stats?.total.cardsCreated ?? 0 }} · 回答 {{ stats?.total.answers ?? 0 }} · 不满意 {{ stats?.total.unsatisfied ?? 0 }}<template v-if="(stats?.total.cardsCreated ?? 0) > 0"> · 回答率 {{ Math.round(stats!.total.answerRate) }}%</template><template v-if="(stats?.batched ?? 0) > 0"> · 攒批待发 {{ stats!.batched }}</template></span></div>
         <div class="row static"><span>框架事实</span><span>{{ facts?.framework || "未生成(Agent 有动作后自动生成)" }}</span></div>
-      </fieldset>
-
-      <div class="save-row">
+      </section>
+      </div>
+      </div>
+      <div v-if="s" class="save-row">
         <button class="kvba-btn primary" @click="save">保存</button>
         <button class="kvba-btn outlined" :disabled="testing" @click="testConnection">测试连接</button>
         <Transition name="fade"><span v-if="savedMsg" class="saved">{{ savedMsg }}</span></Transition>
-      </div>
       </div>
     </section>
 
@@ -339,20 +340,31 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--md-outline-variant);
 }
 .tab {
-  padding: 8px 14px;
+  padding: 8px 16px;
   font-size: var(--fs-md);
   font-weight: 500;
   color: var(--md-on-surface-variant);
   border-bottom: 2px solid transparent;
   transition: color var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out);
 }
+.tab:hover {
+  color: var(--md-on-surface);
+}
 .tab.on {
   color: var(--md-primary);
+  font-weight: 600;
   border-bottom-color: var(--md-primary);
 }
 
+.pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .scroller {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 14px;
   display: flex;
@@ -366,14 +378,15 @@ onUnmounted(() => {
 }
 .group {
   border: 1px solid var(--md-outline-variant);
-  border-radius: var(--r-m);
-  padding: 12px 14px 14px;
+  border-radius: var(--r-l);
+  padding: 12px 16px 14px;
+  background: var(--md-surface);
 }
-legend {
-  padding: 0 6px;
+.group-title {
   font-size: var(--fs-sm);
-  color: var(--md-primary);
+  color: var(--md-on-surface-variant);
   font-weight: 600;
+  letter-spacing: 0.02em;
 }
 .row {
   display: flex;
@@ -383,7 +396,7 @@ legend {
   font-size: var(--fs-md);
 }
 .row > span:first-child {
-  flex: 0 0 118px;
+  flex: 0 0 136px;
   color: var(--md-on-surface-variant);
 }
 .ctrl {
@@ -397,14 +410,49 @@ legend {
   color: var(--md-on-surface);
   font-family: var(--font);
   font-size: var(--fs-md);
+  transition: border-color var(--dur-2) ease, box-shadow var(--dur-2) ease;
+}
+.ctrl:hover {
+  border-color: var(--md-on-surface-variant);
+}
+.ctrl:focus-visible {
+  outline: none;
+  border-color: var(--md-primary);
+  box-shadow: 0 0 0 1px var(--md-primary);
 }
 .ctrl.narrow {
   flex: 0 0 80px;
 }
 .switch-row input.switch {
+  appearance: none;
+  flex: 0 0 auto;
   width: 40px;
   height: 22px;
-  accent-color: var(--md-primary);
+  border-radius: var(--r-full);
+  background: var(--md-outline-variant);
+  border: 1px solid var(--md-outline);
+  position: relative;
+  cursor: pointer;
+  transition: background-color var(--dur-2) ease, border-color var(--dur-2) ease;
+}
+.switch-row input.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--md-surface);
+  box-shadow: var(--shadow-1);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+.switch-row input.switch:checked {
+  background: var(--md-primary);
+  border-color: var(--md-primary);
+}
+.switch-row input.switch:checked::after {
+  transform: translateX(18px);
 }
 .hint {
   font-size: var(--fs-sm);
@@ -428,7 +476,10 @@ code {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-top: 4px;
+  flex: 0 0 auto;
+  padding: 12px 14px;
+  background: var(--md-surface);
+  border-top: 1px solid var(--md-outline-variant);
 }
 .saved {
   color: var(--md-primary);
