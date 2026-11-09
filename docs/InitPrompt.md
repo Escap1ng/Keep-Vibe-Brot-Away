@@ -324,7 +324,7 @@ keep-vibe-brot-away/
 │  ├─ claude-code/             # Rust 工程:src/bin/bridge.rs(hook stdin→POST)
 │  │                           #        src/bin/watcher.rs(JSONL 增量兜底,方案C)
 │  │                           #   注意:watcher 是同一 Cargo 工程的第二个 bin,不是独立目录
-│  └─ opencode-plugin/         # TS 插件(kvba-plugin.ts);.opencode/plugins/ 下为同步副本,CI 校验一致
+│  └─ opencode-plugin/         # TS 插件(kvba-plugin.ts)
 └─ docs/
 ```
 

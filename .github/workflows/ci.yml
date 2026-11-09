@@ -19,7 +19,7 @@ env:
   NODE_VERSION: "20"
 
 jobs:
-  # 前端:vue-tsc 类型检查 + vite 构建;顺带守住 opencode 插件副本同步
+  # 前端:vue-tsc 类型检查 + vite 构建;顺带校验 Node 钩子脚本与配置模板
   frontend:
     name: 前端 (vue-tsc + vite build)
     runs-on: ubuntu-latest
@@ -34,8 +34,13 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: opencode 插件副本必须与源文件一致
-        run: cmp adapters/opencode-plugin/kvba-plugin.ts .opencode/plugins/kvba-plugin.ts
+      - name: Node 钩子语法与配置模板校验
+        run: |
+          node --check adapters/claude-code-hook/kvba-claude-hook.mjs
+          node --check adapters/codex-notify/kvba-codex-hook.mjs
+          node --check adapters/qoder-hook/kvba-qoder-hook.mjs
+          node --check adapters/qoder-hook/install-settings.mjs
+          node -e "for (const f of ['adapters/claude-code-hook/hooks.sample.json','adapters/qoder-hook/hooks.sample.json']) JSON.parse(require('fs').readFileSync(f,'utf8'))"
 
       - name: 类型检查与构建
         run: npm run build

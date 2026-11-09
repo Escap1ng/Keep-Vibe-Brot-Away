@@ -9,7 +9,7 @@
 | 任务 | 首选文档 |
 |---|---|
 | 了解产品、启动应用 | [项目 README](../README.md) |
-| 接入 opencode、Claude Code 或 Codex | [适配器指南](adapters.md) |
+| 接入 opencode、Claude Code、Codex 或 Qoder | [适配器指南](adapters.md) |
 | 理解当前代码如何工作 | [当前架构](architecture.md) |
 | 查看已实现能力与已知限制 | [当前状态](status.md) |
 | 修改代码、运行检查、准备发布 | [工程指南](engineering.md) |

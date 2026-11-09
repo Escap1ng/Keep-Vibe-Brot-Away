@@ -4,7 +4,7 @@
 
 ## 已实现
 
-- opencode、Claude Code 与 Codex 的本地事件接入。
+- opencode、Claude Code、Codex 与 Qoder 的本地事件接入。
 - `turn.ended` / 有效 `session.ended` 驱动的 WorkUnit 聚合。
 - 回合结束时 Git 工作区快照与 Agent 文件声明的降级证据。
 - 带证据、建议动作、风险级别和置信度的确定性 Insight。
@@ -53,6 +53,7 @@
 - Claude Code Node 与 Rust 样例都使用异步钩子，工具事件与边界的到达顺序不具备强保证，也都未接 `PostToolUseFailure`。Rust 样例只订阅 `PostToolUse` 与 `Stop`。
 - Claude JSONL watcher 没有回合边界，只走旧门控。
 - Codex 只有回合完成通知，没有逐工具和测试结果。
+- Qoder 的 `PostToolUse.tool_response` 是字符串；适配器从会话转录读取 `exitCode` 仅用于错误标记，`kvba.event.v1` 尚无执行结果字段。
 - 双路同报按内容指纹判重时，可能保留重复事件，也可能在证据粒度不同时丢掉更精确的一条。
 
 ### 5. 端点发现仍有平台缺口

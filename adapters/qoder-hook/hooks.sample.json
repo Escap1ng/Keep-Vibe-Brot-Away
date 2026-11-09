@@ -1,0 +1,86 @@
+{
+  "_说明": [
+    "把 hooks 里的内容合入 Qoder 设置文件的 hooks 字段(标准构建: ~/.qoder/settings.json;",
+    "Qoder CN 构建实际使用 %USERPROFILE%\\.qoder-cn\\settings.json)。",
+    "把命令里的占位路径换成 kvba-qoder-hook.mjs 的绝对路径,路径含空格时保留引号。",
+    "改完必须重启 IDE:Qoder 目前不支持 hooks 热加载。",
+    "timeout=5 秒 + async:true:上报慢一点也绝不拖住 Agent(铁律 1)。",
+    "matcher 用 \"*\" 而不是枚举工具名:工具分类归一化在脚本里做,不在配置里做。"
+  ],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:\\path\\to\\kvba\\adapters\\qoder-hook\\kvba-qoder-hook.mjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

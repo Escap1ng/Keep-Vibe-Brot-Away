@@ -21,6 +21,8 @@ pub fn agent_family(emitter: &str) -> &str {
         "opencode"
     } else if emitter.starts_with("codex") {
         "codex"
+    } else if emitter.starts_with("qoder") {
+        "qoder"
     } else {
         emitter
     }
@@ -275,6 +277,12 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn qoder_hook_is_its_own_agent_family() {
+        assert_eq!(agent_family("qoder-hook"), "qoder");
+        assert_ne!(agent_family("qoder-hook"), agent_family("claude-code-hook"));
     }
 
     #[test]

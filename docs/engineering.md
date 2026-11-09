@@ -29,17 +29,8 @@
 | `src-tauri/` | Tauri 2 与 Rust 核心 |
 | `src/` | Vue 3 胶囊与设置界面 |
 | `adapters/` | Agent 适配器正本 |
-| `.opencode/plugins/` | opencode 项目部署副本 |
 | `docs/` | 当前文档、RFC 与历史材料 |
 | `.github/workflows/` | CI 与发布流水线 |
-
-opencode 插件正本与部署副本必须完全一致：
-
-```powershell
-$source = Get-FileHash adapters\opencode-plugin\kvba-plugin.ts
-$copy = Get-FileHash .opencode\plugins\kvba-plugin.ts
-if ($source.Hash -ne $copy.Hash) { throw "opencode 插件副本未同步" }
-```
 
 ## 本地验证
 
@@ -75,6 +66,9 @@ Node 适配器至少做语法与 JSON 校验：
 ```powershell
 node --check adapters\claude-code-hook\kvba-claude-hook.mjs
 node --check adapters\codex-notify\kvba-codex-hook.mjs
+node --check adapters\qoder-hook\kvba-qoder-hook.mjs
+node --check adapters\qoder-hook\install-settings.mjs
+Get-Content adapters\qoder-hook\hooks.sample.json -Raw | ConvertFrom-Json | Out-Null
 ```
 
 只改 Markdown 时，至少执行：
@@ -97,7 +91,7 @@ rg -n "work-units\.json|insights\.json|P0|P1|KVBA_DATA_DIR|72 项|三 Agent" REA
 检查项包括：
 
 - Ubuntu 上的前端类型检查与 Vite 构建。
-- opencode 插件副本一致性、独立严格 TypeScript 检查。
+- opencode 插件独立严格 TypeScript 检查。
 - Windows、Ubuntu、macOS 上两个 Rust 工程的 rustfmt、Clippy `-D warnings` 和单元测试。
 
 PR 交付前应等待所有必需检查完成，不能用单个平台本地通过代替矩阵结果。

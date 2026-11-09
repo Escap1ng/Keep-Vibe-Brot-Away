@@ -78,6 +78,7 @@ npm run tauri build -- --bundles nsis
 | opencode | TypeScript 插件 |
 | Claude Code | Node 钩子；Rust bridge 与 JSONL watcher 为可选方案 |
 | Codex | `notify` 脚本 |
+| Qoder | Node 钩子 |
 
 各适配器能看到的信号并不相同。安装、能力矩阵、验证和故障排查统一维护在[适配器指南](docs/adapters.md)。适配器都从 KVBA 运行时写出的 `endpoint.json` 发现本地端点；上报失败会重试，最终丢弃本次事件，但不会阻塞 Agent。
 

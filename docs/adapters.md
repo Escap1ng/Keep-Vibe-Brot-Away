@@ -25,12 +25,13 @@ Windows 默认端点文件为：
 | Claude Code Rust bridge | 是 | 是 | 是 | 需要编译；随附样例异步上报且未配置失败/会话结束事件 |
 | Claude Code JSONL watcher | 是 | 否 | 否 | 暂走旧门控兼容路径 |
 | Codex `notify` | 否 | 是 | 是 | 仅能结合回合结束时 Git 快照，无法提供逐工具证据 |
+| Qoder 钩子 | 是 | 是 | 是 | `tool_response` 为字符串；退出码读自会话转录，v1 协议尚不携带 |
 
 “自动形成 `WorkUnit`”只表示能够收口回合。当前 `kvba.event.v1` 没有标准执行结果字段，因此识别到的测试命令仍会标记为 `Unknown`。
 
 ## opencode
 
-插件正本位于 `adapters/opencode-plugin/kvba-plugin.ts`，仓库内可直接加载的副本位于 `.opencode/plugins/kvba-plugin.ts`。CI 会校验二者完全一致。
+插件正本位于 `adapters/opencode-plugin/kvba-plugin.ts`。仓库不再保留项目内副本；按下面的命令复制到全局或项目插件目录即可。
 
 全局安装：
 
@@ -114,6 +115,34 @@ node adapters\codex-notify\kvba-codex-hook.mjs '{"type":"agent-turn-complete","t
 
 Codex 当前只提供回合完成通知。KVBA 会在该边界读取 Git 工作区，因此仍可生成基于快照的洞察；但无法知道本轮逐工具操作、测试退出状态或审批等待。
 
+## Qoder
+
+把 [hooks.sample.json](../adapters/qoder-hook/hooks.sample.json) 的 `hooks` 合入 Qoder 设置文件，并把命令里的占位路径换成 `kvba-qoder-hook.mjs` 的绝对路径。标准构建读取 `~/.qoder/settings.json`；本机 Qoder CN 构建的设置文件是 `%USERPROFILE%\.qoder-cn\settings.json`（以实际构建加载的为准）。改完必须重启 IDE，Qoder 暂不支持 hooks 热加载。
+
+也可以运行安装脚本，它会自动选择当前构建的设置文件、先备份、只追加缺失的事件：
+
+```powershell
+node adapters\qoder-hook\install-settings.mjs --dry-run   # 先看将改什么
+node adapters\qoder-hook\install-settings.mjs
+```
+
+脚本不会打印设置内容（文件里有凭据），重复执行不会重复追加。
+
+样例订阅 `UserPromptSubmit`、`PostToolUse`、`PostToolUseFailure`、`Stop`、`SubagentStop` 与 `SessionEnd`。工具名会归一化为门控使用的小写名（`Bash` ≡ `run_in_terminal`）。
+
+手工验证（不需要 KVBA 在运行）：
+
+```powershell
+$env:KVBA_HOOK_DEBUG = "1"
+$env:KVBA_HOOK_DRY_RUN = "1"
+'{"hook_event_name":"PostToolUse","session_id":"manual","cwd":"C:\\project","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":"ok","transcript_path":""}' |
+  node adapters\qoder-hook\kvba-qoder-hook.mjs
+```
+
+输出一行归一化事件即正常；去掉 `KVBA_HOOK_DRY_RUN` 后会读取 `endpoint.json` 并上报。
+
+能力边界：IDE 的 `PostToolUse.tool_response` 是字符串。适配器会从 `transcript_path` 指向的会话 JSONL 里匹配本次调用（`tool_use` → `tool_result` → `toolUseResult.exitCode`），只用退出码判定 `hasErrorPath`；`kvba.event.v1` 没有执行结果字段，测试状态仍为 `Unknown`（见阶段一的协议扩展）。
+
 ## 共用故障排查
 
 | 症状 | 检查 | 修复 |
@@ -122,6 +151,7 @@ Codex 当前只提供回合完成通知。KVBA 会在该边界读取 Git 工作�
 | 手工脚本显示 `skip/no-endpoint` | 适配器读取的数据目录是否正确 | 清除错误的 `KVBA_DATA_DIR`，或指向主程序真实数据目录 |
 | 脚本显示 `fail/post` | KVBA 是否仍在运行、端口是否已随机化 | 重启 KVBA 后重新执行手工验证 |
 | Claude Code 没有新事件 | 配置是否已加载到新会话、脚本路径引号是否正确 | 新开会话；路径含空格时保留引号 |
+| Qoder 钩子没有触发 | hooks 是否合入当前构建实际加载的设置文件、是否重启过 IDE | 修正设置文件并重启 IDE |
 | Codex 没有通知 | `notify` 是否处于 TOML 顶层、Node.js 是否可见 | 移到文件顶层并改用 Node.js 绝对路径 |
 
 Windows 运行日志位于 `%LOCALAPPDATA%\dev.kvba.app\logs\KVBA.log`。适配器不向 Agent 显示错误时，以手工验证输出和该日志共同判断。
