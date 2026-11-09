@@ -180,14 +180,23 @@ onUnmounted(() => {
       @pointerdown="onHeaderPointerDown"
     >
       <div class="head-left">
-        <span class="logo-mark"></span>
+        <!-- 品牌记号:应用图标母题(红圆/蓝方/黑杠)的 16px 缩影 -->
+        <svg class="logo-mark" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="6.4" fill="var(--md-primary)" />
+          <rect x="2.2" y="2.2" width="3" height="3" fill="var(--md-secondary)" />
+          <rect x="4" y="9.6" width="8" height="1.8" fill="var(--bb-ink)" />
+        </svg>
         <span class="queue-info">队列 {{ cards.length }}/{{ MAX_PENDING }}</span>
       </div>
       <div class="head-actions">
         <button class="kvba-btn text pressable head-tip" @click="askOne" :disabled="working">
           来一道
         </button>
-        <button class="kvba-btn text pressable head-close" title="关闭" @click="closePanel">✕</button>
+        <button class="kvba-btn text pressable head-close" title="关闭" @click="closePanel">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -247,9 +256,17 @@ onUnmounted(() => {
         <button class="kvba-btn text foot-btn" @click="dismiss(currentCard)">跳过</button>
         <button class="kvba-btn text foot-btn" @click="mute(currentCard)">不再问这类</button>
         <div class="switch">
-          <button v-if="cards.length > 1" class="chev" @click="go(-1)">‹</button>
+          <button v-if="cards.length > 1" class="chev" aria-label="上一张" @click="go(-1)">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M10 3.5L5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
           <span class="count">{{ current + 1 }}/{{ cards.length }}</span>
-          <button v-if="cards.length > 1" class="chev" @click="go(1)">›</button>
+          <button v-if="cards.length > 1" class="chev" aria-label="下一张" @click="go(1)">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M6 3.5L10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
         </div>
       </footer>
     </section>
@@ -326,7 +343,9 @@ onUnmounted(() => {
   width: 28px;
   height: 28px;
   padding: 0;
-  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--md-on-surface-variant);
   border-radius: var(--r-full);
 }
@@ -337,21 +356,9 @@ onUnmounted(() => {
   cursor: grabbing;
 }
 .logo-mark {
-  width: 12px;
-  height: 12px;
-  border-radius: 3px;
-  background: var(--md-primary);
-  position: relative;
-}
-.logo-mark::after {
-  content: "";
-  position: absolute;
-  right: -3px;
-  bottom: -3px;
-  width: 6px;
-  height: 6px;
-  background: var(--md-tertiary);
-  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
 }
 .queue-info {
   font-weight: 600;
@@ -494,8 +501,9 @@ onUnmounted(() => {
   width: 26px;
   height: 26px;
   border-radius: 50%;
-  font-size: 16px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--md-primary);
   transition:
     transform var(--dur-1) var(--ease-out),
@@ -545,7 +553,7 @@ onUnmounted(() => {
   content: "";
   position: absolute;
   inset: 4px;
-  background: var(--md-secondary-container);
+  background: var(--md-primary-container);
   border-radius: 50%;
   animation: breathe 3.2s var(--ease-in-out) infinite alternate;
 }
@@ -573,6 +581,12 @@ onUnmounted(() => {
 }
 .queue-item:active {
   transform: scale(0.98);
+}
+@media (hover: hover) {
+  .queue-item:hover {
+    background: var(--md-surface);
+    box-shadow: var(--shadow-2);
+  }
 }
 .q-kind {
   font-size: var(--fs-sm);
