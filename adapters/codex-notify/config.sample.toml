@@ -12,14 +12,14 @@
 #    放在文件第一行就不会错。
 # 2. **不要加引号、不要写 shell 语法。** Codex 直接把 argv 交给 exec,**不经过 shell**:
 #    没有管道 / `&&` / 重定向 / 环境变量展开,`$HOME` 和 `~` 都不会被展开,只认绝对路径。
-#    好处:路径带空格也**不需要**加引号(这一点和 Trae 相反 —— Trae 那条内层引号坑在这里不存在)。
+#    好处:路径带空格也**不需要**加引号。
 # 3. **`node` 必须在 Codex 所在环境的 PATH 里。** 用 nvm/fnm 时,GUI 启动的 Codex 未必拿到
 #    你 shell 的 PATH;拿不准就写 node 的绝对路径。
 #
 # 能力边界(不是缺陷,别去绕过):
 # - Codex 目前**只有 `agent-turn-complete` 一种 notify 事件**,没有工具级 hook,也没有"回合开始"事件。
 #   所以这一路只能喂出 `turn.ended` → KVBA 的知识分支(贴士 / 破冰 / 知情度)。
-#   **审查卡需要写事件,Codex 这一路永远拿不到** —— 想要审查卡请用 Claude Code 或 Trae。
+#   **审查卡需要写事件,Codex 这一路永远拿不到** —— 想要审查卡请用 Claude Code。
 # - notify 不覆盖审批等待(approval-requested),被审批卡住的回合看起来和还在干活一模一样。
 # - Codex 对 notify 是 fire-and-forget,stdout/stderr 一律丢弃 —— 所以调试只能靠 KVBA_HOOK_DEBUG
 #   加手工管道自证(见下),不要指望在 Codex 终端里看到任何输出。

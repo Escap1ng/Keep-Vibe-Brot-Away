@@ -19,8 +19,6 @@ pub fn agent_family(emitter: &str) -> &str {
         "claude-code"
     } else if emitter.starts_with("opencode") {
         "opencode"
-    } else if emitter.starts_with("trae") {
-        "trae"
     } else if emitter.starts_with("codex") {
         "codex"
     } else {

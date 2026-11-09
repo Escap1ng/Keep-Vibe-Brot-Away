@@ -75,8 +75,6 @@ Node 适配器至少做语法与 JSON 校验：
 ```powershell
 node --check adapters\claude-code-hook\kvba-claude-hook.mjs
 node --check adapters\codex-notify\kvba-codex-hook.mjs
-node --check adapters\trae-hook\kvba-trae-hook.mjs
-Get-Content adapters\trae-hook\hooks.sample.json -Raw | ConvertFrom-Json | Out-Null
 ```
 
 只改 Markdown 时，至少执行：
@@ -100,7 +98,6 @@ rg -n "work-units\.json|insights\.json|P0|P1|KVBA_DATA_DIR|72 项|三 Agent" REA
 
 - Ubuntu 上的前端类型检查与 Vite 构建。
 - opencode 插件副本一致性、独立严格 TypeScript 检查。
-- Trae 钩子语法与示例 JSON。
 - Windows、Ubuntu、macOS 上两个 Rust 工程的 rustfmt、Clippy `-D warnings` 和单元测试。
 
 PR 交付前应等待所有必需检查完成，不能用单个平台本地通过代替矩阵结果。

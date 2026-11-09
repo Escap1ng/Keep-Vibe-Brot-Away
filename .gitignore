@@ -6,7 +6,6 @@ target
 
 # 本地状态与工具链
 .kvba
-.trae
 
 # 本地 agent 工具链(非产品代码)
 .opencode/skills/

@@ -6,7 +6,6 @@
     "$CLAUDE_PROJECT_DIR 由 Claude Code 在拉起 hook 时注入,只在该仓库内跑 Claude Code 时可用;",
     "若你把脚本装在仓库外,换成绝对路径。",
     "**这里的引号是必需的,不要删。** Claude Code 用 bash 执行 hook 命令,路径带空格时必须引号;",
-    "Trae 那条『不要给路径加引号』的规矩来自 trae-sandbox 的 --command-line 拼接,与这里无关。",
     "timeout=3 秒 + async:true:上报慢一点也绝不拖住 Agent(铁律 1)。",
     "matcher 用 \"*\" 而不是枚举工具名:枚举表会漏掉 MultiEdit / NotebookEdit / WebFetch 等,",
     "漏一个工具就等于那类改动永远进不了门控 —— 分类归一化在脚本里做,不在配置里做。"

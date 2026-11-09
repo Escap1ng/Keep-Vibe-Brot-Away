@@ -191,8 +191,8 @@ function normalize(hook) {
       const response = hook.tool_response || {};
       const files = extractFiles(input);
       const command = longestOf(input, ["command", "cmd"]);
-      // 内容/差异字段:Claude Code 用 snake_case(old_string/new_string/content),
-      // Trae 用 camelCase(newString)。两边都列上,别拿一侧的序列化名去猜另一侧。
+      // 内容/差异字段:snake_case(old_string/new_string/content)与 camelCase(newString)
+      // 两种命名都列上,别拿一侧的序列化名去猜另一侧。
       let diff = longestOf(input, [
         "diff",
         "patch",
